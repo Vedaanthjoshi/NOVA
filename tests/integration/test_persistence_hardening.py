@@ -135,13 +135,21 @@ def test_cross_process_sqlite_persistence():
 
             # Resume execution with operator approval
             final_state = graph.invoke(
-                Command(resume={{"approved": True, "notes": "Approved by external OS process"}}),
+                Command(
+                    resume={{
+                        "approved": True,
+                        "approver_id": "sre_subproc_01",
+                        "approver_role": "SRE_LEAD",
+                        "notes": "Approved by external OS process",
+                    }}
+                ),
                 thread_config,
             )
 
             assert final_state["status"] == IncidentStatus.RESOLVED, f"Unexpected status: {{final_state['status']}}"
-            assert len(final_state["execution_history"]) == 1
+            assert len(final_state["execution_history"]) == 2
             assert final_state["execution_history"][0].tool_name == "clear_lockfile"
+            assert final_state["execution_history"][1].tool_name == "resume_workflow"
             assert final_state["verification_history"][0].passed is True
 
             saver.close()
@@ -257,7 +265,14 @@ def test_cross_process_both_phases_in_separate_subprocesses():
             assert state.next == ("executor",)
 
             final_state = graph.invoke(
-                Command(resume={{"approved": True, "notes": "Approved in proc2"}}),
+                Command(
+                    resume={{
+                        "approved": True,
+                        "approver_id": "sre_proc2_01",
+                        "approver_role": "SRE_LEAD",
+                        "notes": "Approved in proc2",
+                    }}
+                ),
                 cfg,
             )
             assert final_state["status"] == IncidentStatus.RESOLVED

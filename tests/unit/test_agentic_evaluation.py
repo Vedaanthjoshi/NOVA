@@ -44,9 +44,10 @@ class TestAgenticGeneralization:
 
         plan = llm.plan(triage, AVAILABLE_TOOLS_FOR_LLM, retry_count=0)
         assert not plan.is_escalation
-        assert len(plan.actions) == 1
+        assert len(plan.actions) == 2
         assert plan.actions[0].tool_name == "clear_lockfile"
         assert "custom_pipeline.lock" in plan.actions[0].parameters["lock_name"]
+        assert plan.actions[1].tool_name == "resume_workflow"
 
     def test_noisy_log_with_buried_service_refusal(self, llm: MockLLMClient):
         """

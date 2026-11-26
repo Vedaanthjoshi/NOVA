@@ -60,18 +60,22 @@ def test_end_to_end_stale_lockfile_resolution(mock_env: MockWorkflowRunner):
     # Assertions on final graph state
     assert final_state["status"] == IncidentStatus.RESOLVED
     assert "transform_job.lock" in final_state["triage_summary"]
-    assert len(final_state["plan"]) == 1
+    assert len(final_state["plan"]) == 2
     assert final_state["plan"][0].tool_name == "clear_lockfile"
+    assert final_state["plan"][1].tool_name == "resume_workflow"
 
     # Verify execution history
-    assert len(final_state["execution_history"]) == 1
+    assert len(final_state["execution_history"]) == 2
+    assert final_state["execution_history"][0].tool_name == "clear_lockfile"
     assert final_state["execution_history"][0].exit_code == 0
     assert final_state["execution_history"][0].success is True
+    assert final_state["execution_history"][1].tool_name == "resume_workflow"
+    assert final_state["execution_history"][1].success is True
 
     # Verify post-condition verification record
     assert len(final_state["verification_history"]) == 1
     assert final_state["verification_history"][0].passed is True
-    assert "Deep verification succeeded" in final_state["verification_history"][0].evidence
+    assert "Read-only state verification passed" in final_state["verification_history"][0].evidence
 
     # Verify the physical target environment
     final_wf = mock_env.get_state()
@@ -201,19 +205,23 @@ def test_end_to_end_cascading_failure_replan_recovery(mock_env: MockWorkflowRunn
     assert final_state["status"] == IncidentStatus.RESOLVED
     assert final_state["retry_count"] == 1
 
-    # Verify execution history contains both actions across the 2 cycles
-    assert len(final_state["execution_history"]) == 2
+    # Verify execution history contains actions across both cycles (including explicit resume_workflow)
+    assert len(final_state["execution_history"]) == 4
     assert final_state["execution_history"][0].tool_name == "clear_lockfile"
     assert final_state["execution_history"][0].success is True
-    assert final_state["execution_history"][1].tool_name == "restart_service"
-    assert final_state["execution_history"][1].success is True
+    assert final_state["execution_history"][1].tool_name == "resume_workflow"
+    assert final_state["execution_history"][1].success is False
+    assert final_state["execution_history"][2].tool_name == "restart_service"
+    assert final_state["execution_history"][2].success is True
+    assert final_state["execution_history"][3].tool_name == "resume_workflow"
+    assert final_state["execution_history"][3].success is True
 
     # Verify verification history: Cycle 1 failed, Cycle 2 succeeded
     assert len(final_state["verification_history"]) == 2
     assert final_state["verification_history"][0].passed is False
     assert "JOB_03_LOAD" in final_state["verification_history"][0].evidence
     assert final_state["verification_history"][1].passed is True
-    assert "Deep verification succeeded" in final_state["verification_history"][1].evidence
+    assert "Read-only state verification passed" in final_state["verification_history"][1].evidence
 
     # Verify physical environment reached 100% operational success
     final_wf = mock_env.get_state()
@@ -254,7 +262,7 @@ def test_end_to_end_retry_budget_exhaustion(mock_env: MockWorkflowRunner):
     # Must escalate because first action (clear lock) still left downstream broken and retries=0
     assert final_state["status"] == IncidentStatus.ESCALATED
     assert final_state["retry_count"] == 0
-    assert len(final_state["execution_history"]) == 1
+    assert len(final_state["execution_history"]) == 2
     assert len(final_state["verification_history"]) == 1
     assert final_state["verification_history"][0].passed is False
     assert "Maximum retry limit" in final_state["final_summary"]

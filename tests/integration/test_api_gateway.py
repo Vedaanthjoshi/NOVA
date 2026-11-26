@@ -311,14 +311,19 @@ def test_scenario_inject_endpoint(api_test_setup):
 def test_list_incidents_endpoint(api_test_setup):
     """Proves that GET /incidents returns tracked incidents."""
     client = api_test_setup["client"]
-    client.post(
+    service = api_test_setup["service"]
+    r1 = client.post(
         "/incidents/trigger",
         json={"incident_id": "INC_LIST_01", "raw_symptoms": "Error A"},
     )
-    client.post(
+    assert r1.status_code == 202
+    service.wait_for_incident("INC_LIST_01", timeout=10.0)
+    r2 = client.post(
         "/incidents/trigger",
         json={"incident_id": "INC_LIST_02", "raw_symptoms": "Error B"},
     )
+    assert r2.status_code == 202
+    service.wait_for_incident("INC_LIST_02", timeout=10.0)
 
     resp = client.get("/incidents")
     assert resp.status_code == 200

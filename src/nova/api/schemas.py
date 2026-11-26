@@ -117,6 +117,10 @@ class IncidentStateResponse(BaseModel):
     target_service: Optional[str]
     raw_symptoms: str
 
+    # Workflow Run Binding (M11)
+    workflow_id: Optional[str] = None
+    workflow_run_id: Optional[str] = None
+
     # Autonomous Investigation Telemetry
     investigation_steps: int = 0
     max_investigation_steps: int = 5
@@ -173,6 +177,7 @@ class ScenarioInjectRequest(BaseModel):
 class ScenarioInjectResponse(BaseModel):
     """Response returned upon injecting a mock operational scenario."""
     workflow_id: str
+    run_id: Optional[str] = None
     scenario: str
     failed_job: Optional[str]
     error_message: Optional[str]

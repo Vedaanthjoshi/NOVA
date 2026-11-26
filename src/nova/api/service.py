@@ -33,7 +33,7 @@ from nova.api.schemas import (
     PendingApprovalDTO,
 )
 from nova.config import settings
-from nova.environments.mock_workflow_runner import MockWorkflowRunner
+from nova.environments.mock_workflow_runner import MockWorkflowRunner, ScenarioType, WorkflowState
 from nova.graph import build_nova_graph
 from nova.llm.client import BaseLLMClient, GeminiLLMClient, MockLLMClient
 from nova.observability import (
@@ -124,6 +124,9 @@ class IncidentService:
         self._in_memory_audits: Dict[str, List[Dict[str, Any]]] = {}
         self._consumed_approvals: Set[Tuple[str, str]] = set()
         self._lock = threading.RLock()
+        # M11: Track the single active (non-terminal) incident ID.
+        # NOVA is a prototype and processes one incident at a time.
+        self._active_incident_id: Optional[str] = None
 
         # Hydrate metadata and persisted telemetry from SQLite on startup if available
         if self._store is not None:
@@ -133,6 +136,57 @@ class IncidentService:
                 saved_telem = self._store.get_telemetry(inc_id)
                 if saved_telem:
                     telemetry.hydrate_incident(inc_id, saved_telem)
+
+    def _has_pending_interrupt(self, incident_id: str) -> bool:
+        """Returns True if the checkpointed graph state has an unresolved HITL interrupt."""
+        try:
+            st = self.graph.get_state({"configurable": {"thread_id": incident_id}})
+            return bool(st and st.tasks and st.tasks[0].interrupts)
+        except Exception:
+            return False
+
+    def _find_active_incident_id(self) -> Optional[str]:
+        """
+        Returns the incident_id of any incident with an active background worker
+        or a pending HITL approval interrupt (M11 single active incident guard).
+        Must be called while holding self._lock.
+        """
+        for inc_id, future in self._running_tasks.items():
+            if future is not None and not future.done():
+                return inc_id
+        if self._active_incident_id and self._has_pending_interrupt(self._active_incident_id):
+            return self._active_incident_id
+        for inc_id in self._incident_metadata.keys():
+            if self._has_pending_interrupt(inc_id):
+                self._active_incident_id = inc_id
+                return inc_id
+        return None
+
+    def _refresh_active_incident_after_cycle(self, incident_id: str) -> None:
+        """Clears _active_incident_id once an incident leaves active remediation / pending approval."""
+        still_paused = self._has_pending_interrupt(incident_id)
+        with self._lock:
+            if self._active_incident_id == incident_id and not still_paused:
+                self._active_incident_id = None
+
+    def inject_scenario(self, scenario_type: ScenarioType) -> WorkflowState:
+        """
+        Injects a synthetic scenario into the shared MockWorkflowRunner and runs
+        the initial batch execution.
+
+        M11: Rejected with ConflictError if any incident is currently running
+        or awaiting human approval, preventing scenario resets from invalidating
+        in-flight operations.
+        """
+        with self._lock:
+            active_id = self._find_active_incident_id()
+            if active_id is not None:
+                raise ConflictError(
+                    f"Cannot reset or inject scenario while incident '{active_id}' is active "
+                    "or awaiting human approval."
+                )
+            self.env.inject_scenario(scenario_type)
+            return self.env.run_workflow()
 
     def _ensure_telemetry_loaded(self, incident_id: str) -> None:
         """Restores prior persisted telemetry before recording new resume/approval events."""
@@ -224,6 +278,18 @@ class IncidentService:
                 raise ConflictError(
                     f"Incident '{incident_id}' already exists."
                 )
+            # M11: Enforce single active incident against the shared workflow environment.
+            active_id = self._find_active_incident_id()
+            if active_id is not None and active_id != incident_id:
+                raise ConflictError(
+                    f"Cannot trigger incident '{incident_id}': incident '{active_id}' is already "
+                    "active or awaiting approval. Resolve or escalate it before starting another incident."
+                )
+
+            wf_state = self.env.get_state()
+            bound_wf_id = wf_state.workflow_id if wf_state else None
+            bound_run_id = wf_state.run_id if wf_state else None
+            self._active_incident_id = incident_id
 
             self._incident_metadata[incident_id] = {
                 "incident_id": incident_id,
@@ -249,6 +315,8 @@ class IncidentService:
             "target_service": request.target_service or "UNKNOWN",
             "raw_symptoms": request.raw_symptoms,
             "status": IncidentStatus.TRIGGERED,
+            "workflow_id": bound_wf_id,
+            "workflow_run_id": bound_run_id,
             "triage_summary": None,
             "root_cause_hypothesis": None,
             "plan": [],
@@ -323,6 +391,7 @@ class IncidentService:
                     if self._store is not None:
                         self._store.touch_incident(incident_id, updated_iso)
                     self._persist_telemetry(incident_id)
+                    self._refresh_active_incident_after_cycle(incident_id)
                     log_event(
                         logger,
                         logging.INFO,
@@ -446,6 +515,8 @@ class IncidentService:
             status=current_status,
             target_service=vals.get("target_service"),
             raw_symptoms=vals.get("raw_symptoms", ""),
+            workflow_id=vals.get("workflow_id"),
+            workflow_run_id=vals.get("workflow_run_id"),
             investigation_steps=vals.get("investigation_steps", 0),
             max_investigation_steps=vals.get("max_investigation_steps", 5),
             investigation_evidence=list(vals.get("investigation_evidence") or []),
@@ -564,6 +635,16 @@ class IncidentService:
             expected_request_id = interrupt_val.get("approval_request_id")
             expected_action_hash = interrupt_val.get("action_hash")
             tool_name = interrupt_val.get("tool_name")
+
+            # M11: Verify workflow run binding before resuming a destructive operation
+            bound_run_id = interrupt_val.get("workflow_run_id") or checkpoint_state.values.get("workflow_run_id")
+            if bound_run_id:
+                current_wf = self.env.get_state()
+                if current_wf is None or current_wf.run_id != bound_run_id:
+                    raise ConflictError(
+                        f"Workflow run binding mismatch: approval was requested for run '{bound_run_id}', "
+                        f"but active run is '{current_wf.run_id if current_wf else 'NONE'}'."
+                    )
 
             if request.action_id != expected_action_id:
                 raise ValueError(
@@ -705,6 +786,7 @@ class IncidentService:
                         if self._store is not None:
                             self._store.touch_incident(incident_id, updated_iso)
                         self._persist_telemetry(incident_id)
+                        self._refresh_active_incident_after_cycle(incident_id)
 
             future = self._executor.submit(_resume)
             self._running_tasks[incident_id] = future

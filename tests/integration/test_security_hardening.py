@@ -389,7 +389,7 @@ def test_authorized_rbac_approval_records_audit_trail_in_execution_record(mock_e
     )
 
     assert final_state["status"] == IncidentStatus.RESOLVED
-    assert len(final_state["execution_history"]) == 1
+    assert len(final_state["execution_history"]) == 2
 
     exec_record = final_state["execution_history"][0]
     assert exec_record.tool_name == "clear_lockfile"
@@ -397,6 +397,7 @@ def test_authorized_rbac_approval_records_audit_trail_in_execution_record(mock_e
     assert exec_record.approved_by == "admin_dave"
     assert exec_record.approver_role == "PLATFORM_ADMIN"
     assert exec_record.approval_id == "APPR_TICKET_99182"
+    assert final_state["execution_history"][1].tool_name == "resume_workflow"
     assert not (mock_env.locks_dir / "transform_job.lock").exists()
 
 

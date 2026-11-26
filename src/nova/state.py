@@ -119,6 +119,10 @@ class NovaState(BaseModel):
     raw_symptoms: str
     status: IncidentStatus = IncidentStatus.TRIGGERED
 
+    # Workflow Run Binding (M11)
+    workflow_id: Optional[str] = None
+    workflow_run_id: Optional[str] = None
+
     # Investigation & Triage
     investigation_steps: int = 0
     max_investigation_steps: int = 5
@@ -159,6 +163,10 @@ class NovaGraphState(TypedDict, total=False):
     target_service: str
     raw_symptoms: str
     status: IncidentStatus
+
+    # Workflow Run Binding (M11)
+    workflow_id: Optional[str]
+    workflow_run_id: Optional[str]
 
     # Investigation & Triage
     investigation_steps: int

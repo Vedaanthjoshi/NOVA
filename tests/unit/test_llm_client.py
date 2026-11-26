@@ -137,11 +137,13 @@ class TestMockLLMClientPlan:
 
         assert isinstance(result, PlannerResult)
         assert result.is_escalation is False
-        assert len(result.actions) == 1
+        assert len(result.actions) == 2
         action = result.actions[0]
         assert action.tool_name == "clear_lockfile"
         assert action.parameters["lock_name"] == "transform_job.lock"  # from triage, not hardcoded
         assert action.risk_level == RiskLevel.DESTRUCTIVE
+        assert result.actions[1].tool_name == "resume_workflow"
+        assert result.actions[1].parameters["workflow_id"] == "WF_NIGHTLY_BATCH_1001"
 
     def test_service_offline_plans_restart_service(self, llm: MockLLMClient):
         """Planner produces restart_service with the exact service name from triage."""
@@ -156,8 +158,10 @@ class TestMockLLMClientPlan:
         result = llm.plan(triage, AVAILABLE_TOOLS_FOR_LLM, retry_count=0)
 
         assert result.is_escalation is False
+        assert len(result.actions) == 2
         assert result.actions[0].tool_name == "restart_service"
         assert result.actions[0].parameters["service_name"] == "reporting_warehouse_service"
+        assert result.actions[1].tool_name == "resume_workflow"
 
     def test_data_corruption_triggers_escalation(self, llm: MockLLMClient):
         """Non-recoverable failures MUST escalate — never produce tool actions."""

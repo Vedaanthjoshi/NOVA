@@ -216,13 +216,13 @@ def test_cascading_failure_replanning_and_telemetry_via_api(tmp_path: Path):
         final_st = service.wait_for_incident("INC_CASCADE_API_01", timeout=10.0)
         assert final_st is not None
         assert final_st.status == IncidentStatus.RESOLVED
-        assert len(final_st.execution_history) == 2
+        assert len(final_st.execution_history) == 4
         assert len(final_st.verification_history) == 2
         assert len(final_st.approval_audit_history) == 2
         assert final_st.telemetry is not None
         assert final_st.telemetry["llm_request_count"] >= 4
         assert final_st.telemetry["diagnostic_tool_count"] >= 2
-        assert final_st.telemetry["remediation_tool_count"] == 2
+        assert final_st.telemetry["remediation_tool_count"] == 4
 
         # Verify physical simulator consistency
         wf = env.get_state()
@@ -506,6 +506,13 @@ def test_diagnostic_check_service_status_in_plan_does_not_fail_verification(tmp_
                         risk_level=RiskLevel.DESTRUCTIVE,
                         rationale="Restart offline warehouse service",
                         expected_outcome="Service is RUNNING",
+                    ),
+                    PlannedActionSchema(
+                        tool_name="resume_workflow",
+                        parameters={"workflow_id": "WF_NIGHTLY_BATCH_1001"},
+                        risk_level=RiskLevel.LOW_RISK,
+                        rationale="Re-execute workflow after service restart",
+                        expected_outcome="All workflow jobs succeed",
                     ),
                 ],
             )

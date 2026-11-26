@@ -466,6 +466,8 @@ class MockLLMClient(BaseLLMClient):
                 actions=[],
             )
 
+        active_workflow_id = triage.workflow_id or "WF_NIGHTLY_BATCH_1001"
+
         if triage.failure_type == "STALE_LOCKFILE":
             return PlannerResult(
                 is_escalation=False,
@@ -480,7 +482,19 @@ class MockLLMClient(BaseLLMClient):
                             "can re-acquire the execution lock and proceed."
                         ),
                         expected_outcome=f"Lockfile '{triage.implicated_resource}' no longer exists on the filesystem.",
-                    )
+                    ),
+                    # M11: resume_workflow is an explicit planned action — the verifier is now
+                    # read-only and does NOT call run_workflow() internally.
+                    PlannedActionSchema(
+                        tool_name="resume_workflow",
+                        parameters={"workflow_id": active_workflow_id},
+                        risk_level=RiskLevel.LOW_RISK,
+                        rationale=(
+                            "Re-execute the batch pipeline now that the stale lock has been cleared. "
+                            "This is required so the verifier can observe a completed workflow state."
+                        ),
+                        expected_outcome="All batch jobs complete successfully with exit_code=0.",
+                    ),
                 ],
             )
 
@@ -498,7 +512,18 @@ class MockLLMClient(BaseLLMClient):
                             "and unblock the downstream load job."
                         ),
                         expected_outcome=f"'{triage.implicated_resource}' status is RUNNING and port is accepting connections.",
-                    )
+                    ),
+                    # M11: resume_workflow is an explicit planned action — verifier is read-only.
+                    PlannedActionSchema(
+                        tool_name="resume_workflow",
+                        parameters={"workflow_id": active_workflow_id},
+                        risk_level=RiskLevel.LOW_RISK,
+                        rationale=(
+                            "Re-execute the batch pipeline now that the offline service has been restarted. "
+                            "This is required so the verifier can observe a completed workflow state."
+                        ),
+                        expected_outcome="All batch jobs complete successfully with exit_code=0.",
+                    ),
                 ],
             )
 
@@ -516,7 +541,17 @@ class MockLLMClient(BaseLLMClient):
                             "dependency after upstream remediation completed."
                         ),
                         expected_outcome=f"'{triage.implicated_resource}' is healthy and batch pipeline can complete.",
-                    )
+                    ),
+                    # M11: resume_workflow is an explicit planned action — verifier is read-only.
+                    PlannedActionSchema(
+                        tool_name="resume_workflow",
+                        parameters={"workflow_id": active_workflow_id},
+                        risk_level=RiskLevel.LOW_RISK,
+                        rationale=(
+                            "Re-execute the batch pipeline now that the dependency service has been restarted."
+                        ),
+                        expected_outcome="All batch jobs complete successfully with exit_code=0.",
+                    ),
                 ],
             )
 
@@ -582,11 +617,21 @@ class MockLLMClient(BaseLLMClient):
         investigation_evidence: Optional[List[str]] = None,
         original_diagnosis: Optional[Dict[str, Any]] = None,
     ) -> ReplannerResult:
-        # Case 1: Check if previous action execution failed
+        # Case 1: Check if previous remediation action failed.
+        # Note (M11): If the last record was `resume_workflow` failing because a DOWNSTREAM job
+        # failed (`new_target != original_target`), the preceding remediation tool succeeded and
+        # exposed the downstream failure — fall through to Case 2 instead of blaming the upstream fix.
         if execution_records:
             last_record = execution_records[-1]
+            last_tool = last_record.get("tool_name") if isinstance(last_record, dict) else getattr(last_record, "tool_name", "")
             success = last_record.get("success") if isinstance(last_record, dict) else getattr(last_record, "success", True)
-            if not success:
+            is_downstream_resume_halt = (
+                last_tool == "resume_workflow"
+                and not success
+                and new_target
+                and new_target != original_target
+            )
+            if not success and not is_downstream_resume_halt:
                 stderr = last_record.get("stderr") if isinstance(last_record, dict) else getattr(last_record, "stderr", "")
                 exit_code = last_record.get("exit_code") if isinstance(last_record, dict) else getattr(last_record, "exit_code", 1)
                 orig_diag = original_diagnosis or {}
@@ -984,6 +1029,7 @@ Analyze and return JSON diagnosis."""
         available_tools: List[Dict[str, Any]],
         retry_count: int,
     ) -> PlannerResult:
+        active_wf_id = triage.workflow_id or "WF_NIGHTLY_BATCH_1001"
         system_prompt = f"""You are a remediation planner for an enterprise batch pipeline.
 
 Given a structured incident triage, produce an ordered remediation plan.
@@ -1008,12 +1054,18 @@ Output MUST be valid JSON:
 Rules:
 - If is_escalation=true, actions MUST be empty and escalation_reason MUST be set.
 - If is_escalation=false, escalation_reason MUST be null.
+- If is_escalation=false, actions MUST contain at least one action.
 - tool_name MUST exactly match one from the available tools list.
 - parameters MUST use the exact key names from the tool's signature.
 - parameter VALUES must come from the triage context — never invent them.
 - This is retry cycle {retry_count + 1}. Avoid repeating actions that already failed.
+- IMPORTANT: After any mutating action (clear_lockfile, restart_service), you MUST include
+  resume_workflow as the next action with workflow_id="{active_wf_id}".
+  The verifier is strictly read-only and will only inspect the workflow state — it does NOT
+  re-execute the pipeline. resume_workflow is required to actually run the jobs.
 """
         user_prompt = f"""Triage result:
+- workflow_id: {active_wf_id}
 - failure_type: {triage.failure_type}
 - implicated_resource: {triage.implicated_resource}
 - triage_summary: {triage.triage_summary}
@@ -1058,9 +1110,10 @@ Output MUST be valid JSON:
 
 Critical Reasoning Instructions:
 - Do NOT assume the previous action succeeded. Check whether execution records show success or failure.
-- If the previous action failed, revise the hypothesis and formulate an alternative strategy.
-- If the previous action succeeded and revealed a new downstream blockage, focus on the new failed service.
-- If data corruption or an unresolvable defect is observed, set is_escalation=true and explain why.
+- If a remediation tool (e.g. clear_lockfile, restart_service) failed or failed its postcondition, revise the hypothesis and formulate an alternative strategy (or escalate if unrecoverable).
+- If the upstream remediation tool succeeded and `resume_workflow` halted on a DIFFERENT downstream failed job, diagnose the newly surfaced downstream failure in `new_target` from its log.
+- If data corruption or an unresolvable defect is observed, set is_escalation=true, escalation_reason non-empty, and is_recoverable=false.
+- If is_escalation=false, set escalation_reason=null.
 - implicated_resource must come strictly from logs or telemetry — never invent names.
 """
         exec_json = json.dumps(execution_records or [], indent=2)

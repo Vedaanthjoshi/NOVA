@@ -4,6 +4,11 @@ import logging
 import time
 from typing import Any, Dict, Optional
 from langgraph.types import interrupt
+from nova.environments.mock_workflow_runner import (
+    JobStatus,
+    MockWorkflowRunner,
+    resolve_contained_path,
+)
 from nova.observability import incident_context, log_event, telemetry
 from nova.state import (
     ALLOWED_APPROVER_ROLES,
@@ -17,8 +22,104 @@ from nova.tools.runner import ToolRunner
 logger = logging.getLogger("nova.nodes.executor")
 
 
-def create_executor_node(runner: ToolRunner, require_approval: bool = True):
-    """Factory returning an executor node bound to a ToolRunner and HITL safety policy."""
+def _resolve_env(runner: ToolRunner, env: Optional[MockWorkflowRunner]) -> Optional[MockWorkflowRunner]:
+    """Extracts MockWorkflowRunner from injected argument or registered tools."""
+    if env is not None:
+        return env
+    for tool in runner._registry.values():
+        tool_env = getattr(tool, "env", None)
+        if isinstance(tool_env, MockWorkflowRunner):
+            return tool_env
+    return None
+
+
+def _check_run_binding(state: NovaGraphState, env: Optional[MockWorkflowRunner]) -> Optional[str]:
+    """
+    Validates that the current workflow state on disk still matches the workflow_id
+    and workflow_run_id captured when this incident started.
+    Returns None if valid or unbound; returns an error message if mismatched.
+    """
+    bound_run_id = state.get("workflow_run_id")
+    bound_wf_id = state.get("workflow_id")
+    if not bound_run_id or env is None:
+        return None
+    current_wf = env.get_state()
+    if current_wf is None:
+        return (
+            f"Workflow run binding violation: expected run '{bound_run_id}' "
+            f"({bound_wf_id}), but active workflow state is absent."
+        )
+    if current_wf.run_id != bound_run_id or (bound_wf_id and current_wf.workflow_id != bound_wf_id):
+        return (
+            f"Workflow run binding violation: incident is bound to run '{bound_run_id}' "
+            f"({bound_wf_id}), but environment currently holds run '{current_wf.run_id}' "
+            f"({current_wf.workflow_id})."
+        )
+    return None
+
+
+def _check_postcondition(
+    tool_name: str, parameters: Dict[str, Any], env: Optional[MockWorkflowRunner]
+) -> Optional[str]:
+    """
+    Deterministic post-condition check for mutating actions.
+
+    Returns None if the postcondition is satisfied (action had its intended effect).
+    Returns an error string if the postcondition failed (action did not produce expected state).
+
+    READ_ONLY tools have no postcondition — they observe state, they do not change it.
+    """
+    if env is None:
+        return None
+
+    if tool_name == "clear_lockfile":
+        lock_name = parameters.get("lock_name", "")
+        if not lock_name:
+            return None
+        state = env.get_state()
+        if state and lock_name in state.active_locks:
+            return f"Postcondition failed: '{lock_name}' is still listed in active_locks after clear_lockfile."
+        safe_lock = resolve_contained_path(env.locks_dir, lock_name)
+        if safe_lock is None:
+            return f"Postcondition check: unsafe lock_name '{lock_name}' rejected."
+        if safe_lock.exists():
+            return f"Postcondition failed: lockfile '{lock_name}' still present on disk after removal."
+        return None
+
+    if tool_name == "restart_service":
+        service_name = parameters.get("service_name", "")
+        if not service_name:
+            return None
+        try:
+            status = env.check_service_status(service_name)
+            if not status.get("healthy", False):
+                return (
+                    f"Postcondition failed: '{service_name}' is still unhealthy "
+                    f"(status={status.get('status', 'UNKNOWN')}) after restart."
+                )
+        except Exception as exc:
+            return f"Postcondition check error for restart_service: {exc}"
+        return None
+
+    if tool_name == "resume_workflow":
+        state = env.get_state()
+        if state is None:
+            return "Postcondition failed: workflow state absent after resume_workflow."
+        failed = [j.id for j in state.jobs.values() if j.status != JobStatus.SUCCESS]
+        if failed:
+            return f"Postcondition failed: jobs not in SUCCESS state after resume_workflow: {failed}"
+        return None
+
+    return None
+
+
+def create_executor_node(
+    runner: ToolRunner,
+    env: Optional[MockWorkflowRunner] = None,
+    require_approval: bool = True,
+):
+    """Factory returning an executor node bound to a ToolRunner, environment, and HITL safety policy."""
+    resolved_env = _resolve_env(runner, env)
 
     def executor_node(state: NovaGraphState) -> Dict[str, Any]:
         with incident_context(state.get("incident_id")):
@@ -28,20 +129,14 @@ def create_executor_node(runner: ToolRunner, require_approval: bool = True):
         """
         Executor Node (Hardened Safety & Authorization):
         1. Retrieves the next planned action.
-        2. Ground-Truth Risk Lookup: Disregards LLM-generated action.risk_level and looks up
-           the authoritative risk level from runner.get_tool(action.tool_name).risk_level.
-           If the tool is unknown or risk cannot be determined, fails closed (ESCALATED).
-        3. Policy Gate: If the tool is DESTRUCTIVE and require_approval is True,
-           halts execution and triggers a LangGraph interrupt() with structured
-           approval context.
-        4. Upon resumption:
-           - Parses response into ApprovalDecision.
-           - Enforces strict boolean: decision.approved is True.
-           - Enforces action, incident, and optional action_hash binding.
-           - Enforces RBAC: approver_role must belong to ALLOWED_APPROVER_ROLES.
-           - If rejected, invalid, or unauthorized, halts execution and transitions to ESCALATED.
-        5. Executes authorized tool via ToolRunner and records approval metadata into ExecutionRecord.
-        6. Appends resulting ExecutionRecord to execution_history.
+        2. Ground-Truth Risk Lookup from registry — LLM risk rating is ignored.
+        3. Validates workflow run binding (M11) and tool parameter schema before HITL interrupt.
+        4. Policy Gate: DESTRUCTIVE actions require LangGraph interrupt() with structured approval.
+           Permissive raw-bool and incomplete dict approval shortcuts are REJECTED.
+        5. Re-validates workflow run binding after HITL resumption.
+        6. Executes the authorized tool via ToolRunner.
+        7. Deterministic postcondition check for mutating actions (M11).
+        8. Advances current_action_index on clean execution + passing postcondition.
         """
         incident_id = state.get("incident_id", "INC_DEFAULT")
         plan = state.get("plan", [])
@@ -87,10 +182,37 @@ def create_executor_node(runner: ToolRunner, require_approval: bool = True):
                 "final_summary": reason,
             }
 
+        # Check workflow run binding before interrupting or executing mutating operations
+        if effective_risk != RiskLevel.READ_ONLY:
+            binding_err = _check_run_binding(state, resolved_env)
+            if binding_err:
+                reason = f"Incident Escalated: {binding_err}"
+                telemetry.record_terminal_reason(incident_id, "ESCALATED", reason)
+                log_event(logger, logging.WARNING, "executor_run_binding_mismatch", reason)
+                return {
+                    "status": IncidentStatus.ESCALATED,
+                    "final_summary": reason,
+                }
+
         decision: Optional[ApprovalDecision] = None
 
         # Safety Gate: Human-in-the-Loop Checkpoint for DESTRUCTIVE actions
         if require_approval and effective_risk == RiskLevel.DESTRUCTIVE:
+            # Validate parameters against tool schema BEFORE presenting an approval interrupt
+            try:
+                tool.args_schema.model_validate(action.parameters)
+            except Exception as param_exc:
+                reason = (
+                    f"Incident Escalated: Destructive action '{action.tool_name}' ({action.action_id}) "
+                    f"failed parameter validation before approval: {param_exc}"
+                )
+                telemetry.record_terminal_reason(incident_id, "ESCALATED", reason)
+                log_event(logger, logging.WARNING, "executor_invalid_destructive_params", reason)
+                return {
+                    "status": IncidentStatus.ESCALATED,
+                    "final_summary": reason,
+                }
+
             # Deterministic approval_request_id so LangGraph node replay on resume produces the exact same ID
             approval_request_id = f"APPR_{incident_id}_{action.action_id}_{action_hash[:8]}"
             approval_payload = {
@@ -98,6 +220,8 @@ def create_executor_node(runner: ToolRunner, require_approval: bool = True):
                 "action_id": action.action_id,
                 "action_hash": action_hash,
                 "incident_id": state.get("incident_id"),
+                "workflow_id": state.get("workflow_id"),
+                "workflow_run_id": state.get("workflow_run_id"),
                 "tool_name": action.tool_name,
                 "parameters": action.parameters,
                 "risk_level": effective_risk.value,
@@ -163,7 +287,7 @@ def create_executor_node(runner: ToolRunner, require_approval: bool = True):
                     is_approved = True
                     decision = response
 
-            # Case 2: Dictionary payload (kept backwards-compatible for direct graph tests)
+            # Case 2: Dictionary payload — requires explicit approver_id and approver_role (no defaults injected)
             elif isinstance(response, dict):
                 raw_approved = response.get("approved")
                 if type(raw_approved) is not bool or raw_approved is not True:
@@ -194,10 +318,16 @@ def create_executor_node(runner: ToolRunner, require_approval: bool = True):
                             f"got '{res_action_hash}'."
                         )
                     else:
-                        approver_id = response.get("approver_id") or "mock_operator"
-                        approver_role = response.get("approver_role") or "L2_OPERATIONS"
+                        approver_id = response.get("approver_id")
+                        approver_role = response.get("approver_role")
 
-                        if approver_role not in ALLOWED_APPROVER_ROLES:
+                        if not isinstance(approver_id, str) or not approver_id.strip():
+                            is_approved = False
+                            rejection_reason = "Security Alert: approver_id is required in approval payload."
+                        elif not isinstance(approver_role, str) or not approver_role.strip():
+                            is_approved = False
+                            rejection_reason = "Security Alert: approver_role is required in approval payload."
+                        elif approver_role not in ALLOWED_APPROVER_ROLES:
                             is_approved = False
                             rejection_reason = (
                                 f"Security Alert: Unauthorized approver role '{approver_role}'. "
@@ -207,7 +337,7 @@ def create_executor_node(runner: ToolRunner, require_approval: bool = True):
                             try:
                                 decision = ApprovalDecision(
                                     approved=True,
-                                    approver_id=approver_id,
+                                    approver_id=approver_id.strip(),
                                     approver_role=approver_role,
                                     decision_timestamp=(
                                         response.get("decision_timestamp")
@@ -224,24 +354,13 @@ def create_executor_node(runner: ToolRunner, require_approval: bool = True):
                                 is_approved = False
                                 rejection_reason = f"Security Alert: Malformed approval payload: {str(exc)}"
 
-            # Case 3: Raw boolean (backwards-compatible for direct graph tests)
+            # Case 3: Raw boolean — REJECTED in operational mode (no identity, no role, no binding)
             elif type(response) is bool:
-                if response is True:
-                    decision = ApprovalDecision(
-                        approved=True,
-                        approver_id="mock_operator",
-                        approver_role="L2_OPERATIONS",
-                        decision_timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
-                        incident_id=state.get("incident_id", "INC_DEFAULT"),
-                        action_id=action.action_id,
-                        approval_request_id=approval_request_id,
-                        action_hash=action_hash,
-                        notes="Direct boolean approval",
-                    )
-                    is_approved = True
-                else:
-                    is_approved = False
-                    rejection_reason = "Action was REJECTED by human operator (boolean False)."
+                is_approved = False
+                rejection_reason = (
+                    "Security Alert: Raw boolean approval rejected in operational mode. "
+                    "Submit an ApprovalDecision or dict with approver_id and approver_role."
+                )
 
             # Case 4: Any other malformed input
             else:
@@ -270,6 +389,17 @@ def create_executor_node(runner: ToolRunner, require_approval: bool = True):
                     "final_summary": reason,
                 }
 
+            # Re-verify workflow run binding after HITL resume in case environment changed while paused
+            post_resume_binding_err = _check_run_binding(state, resolved_env)
+            if post_resume_binding_err:
+                reason = f"Incident Escalated: {post_resume_binding_err} Execution aborted after approval."
+                telemetry.record_terminal_reason(incident_id, "ESCALATED", reason)
+                log_event(logger, logging.WARNING, "executor_post_resume_run_mismatch", reason)
+                return {
+                    "status": IncidentStatus.ESCALATED,
+                    "final_summary": reason,
+                }
+
         # Safe autonomous execution (or approved destructive execution)
         record = runner.execute(action)
         if decision is not None:
@@ -281,30 +411,50 @@ def create_executor_node(runner: ToolRunner, require_approval: bool = True):
                 }
             )
 
-        # Multi-Step Execution & Failure Handling (Milestone 7.2 Phase B)
+        # Multi-Step Execution & Failure Handling
         retry_count = state.get("retry_count", 0)
         max_retries = state.get("max_retries", 3)
         is_exhausted = retry_count >= max_retries
 
-        # If action failed, stop the remaining plan and route appropriately
+        # If action execution failed, stop remaining plan and route to verifier (which records
+        # VerificationRecord and escalates if retry budget is exhausted).
         if not record.success:
             reason = (
-                f"Incident Escalated: Action '{action.action_id}' ({action.tool_name}) failed execution and retries exhausted."
-                if is_exhausted
-                else f"Execution failed for action '{action.action_id}' ({action.tool_name}): {record.stderr}. Aborting remaining plan."
+                f"Execution failed for action '{action.action_id}' ({action.tool_name}): "
+                f"{record.stderr}. Aborting remaining plan."
             )
-            telemetry.record_terminal_reason(
-                incident_id,
-                "ESCALATED" if is_exhausted else "FAILED",
-                reason,
-            )
+            if is_exhausted:
+                telemetry.record_terminal_reason(incident_id, "ESCALATED", reason)
             return {
                 "execution_history": [record],
-                "status": IncidentStatus.ESCALATED if is_exhausted else IncidentStatus.FAILED,
+                "status": IncidentStatus.FAILED,
                 "final_summary": reason,
             }
 
-        # Action succeeded: Advance current_action_index to the next planned action
+        # M11: Deterministic postcondition check for mutating actions.
+        postcondition_error = _check_postcondition(action.tool_name, action.parameters, resolved_env)
+        if postcondition_error:
+            reason = (
+                f"Execution postcondition failed for '{action.action_id}' ({action.tool_name}): "
+                f"{postcondition_error}. Aborting remaining plan."
+            )
+            if is_exhausted:
+                telemetry.record_terminal_reason(incident_id, "ESCALATED", reason)
+            log_event(
+                logger,
+                logging.WARNING,
+                "executor_postcondition_failed",
+                reason,
+                action_id=action.action_id,
+                tool_name=action.tool_name,
+            )
+            return {
+                "execution_history": [record],
+                "status": IncidentStatus.FAILED,
+                "final_summary": reason,
+            }
+
+        # Action succeeded and postcondition passed: advance to the next planned action
         next_index = index + 1
         if next_index < len(plan):
             return {

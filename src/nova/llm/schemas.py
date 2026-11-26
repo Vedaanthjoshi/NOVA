@@ -102,6 +102,10 @@ class TriageResult(BaseModel):
         default="HIGH",
         description="Confidence level in the diagnosis: HIGH, MEDIUM, or LOW."
     )
+    workflow_id: Optional[str] = Field(
+        default=None,
+        description="Active workflow ID associated with the diagnosed incident, if known."
+    )
 
 
 class PlannedActionSchema(BaseModel):
@@ -143,6 +147,10 @@ class PlannerResult(BaseModel):
     
     Either contains an ordered list of actions OR an escalation decision.
     The graph uses is_escalation to route — not keyword matching on strings.
+
+    M11 correctness fix: a non-escalating plan with zero actions is invalid.
+    The LLM must either provide at least one action or declare is_escalation=True.
+    This prevents the graph from entering EXECUTING status with nothing to execute.
     """
     is_escalation: bool = Field(
         description=(
@@ -158,7 +166,10 @@ class PlannerResult(BaseModel):
         default_factory=list,
         description=(
             "Ordered list of actions to execute. Must be empty if is_escalation=True. "
-            "Actions are executed in order; each depends on the previous succeeding."
+            "Must be non-empty if is_escalation=False. "
+            "Actions are executed in order; each depends on the previous succeeding. "
+            "IMPORTANT: Include resume_workflow as the final action after any mutating fix "
+            "(clear_lockfile, restart_service) so the workflow actually re-executes before verification."
         )
     )
 
@@ -168,19 +179,31 @@ class PlannerResult(BaseModel):
         Enforce the escalation contract:
           - is_escalation=True  MUST have escalation_reason set and actions empty.
           - is_escalation=False MUST NOT have escalation_reason set.
+          - is_escalation=False MUST have at least one action (M11 fix).
 
         This catches malformed LLM output at the schema boundary before it
         reaches any node or routing logic.
         """
-        if self.is_escalation and not self.escalation_reason:
+        if self.is_escalation and (not self.escalation_reason or not self.escalation_reason.strip()):
             raise ValueError(
                 "escalation_reason must be set when is_escalation=True. "
                 "The LLM must explain why no automated fix is possible."
+            )
+        if self.is_escalation and len(self.actions) > 0:
+            raise ValueError(
+                "actions must be empty when is_escalation=True. "
+                "An escalating plan cannot also schedule remediation actions."
             )
         if not self.is_escalation and self.escalation_reason:
             raise ValueError(
                 "escalation_reason must be None when is_escalation=False. "
                 "Only set it when actually escalating."
+            )
+        # M11: Reject empty non-escalating plans — they produce EXECUTING with no execution.
+        if not self.is_escalation and len(self.actions) == 0:
+            raise ValueError(
+                "actions must be non-empty when is_escalation=False. "
+                "Provide at least one remediation action, or set is_escalation=True with an escalation_reason."
             )
         return self
 
@@ -238,7 +261,8 @@ class ReplannerResult(BaseModel):
 
     @model_validator(mode="after")
     def validate_replanner_escalation(self) -> "ReplannerResult":
-        if self.is_escalation and not self.escalation_reason:
+        if self.is_escalation and (not self.escalation_reason or not self.escalation_reason.strip()):
             raise ValueError("escalation_reason must be provided when is_escalation is True.")
+        if not self.is_escalation and self.escalation_reason:
+            raise ValueError("escalation_reason must be None when is_escalation is False.")
         return self
-

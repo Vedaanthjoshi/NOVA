@@ -123,9 +123,9 @@ def build_nova_graph(
 
     # Add all nodes — each factory injects its dependencies
     graph_builder.add_node("triage", create_triage_node(env, llm_client, tool_runner=runner))
-    graph_builder.add_node("planner", create_planner_node(llm_client))
-    graph_builder.add_node("executor", create_executor_node(runner, require_approval=approval_policy))
-    graph_builder.add_node("verifier", create_verifier_node(env))
+    graph_builder.add_node("planner", create_planner_node(llm_client, env=env))
+    graph_builder.add_node("executor", create_executor_node(runner, env=env, require_approval=approval_policy))
+    graph_builder.add_node("verifier", create_verifier_node(env, tool_runner=runner))
     graph_builder.add_node("replanner", create_replanner_node(env, llm_client))
 
     # Wire transitions

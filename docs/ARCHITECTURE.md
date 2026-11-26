@@ -70,28 +70,30 @@ flowchart TD
   - Appends immutable `ExecutionRecord` entries into graph state via `operator.add` reducer.
 
 ### Node 4: Post-Condition Verification (`src/nova/nodes/verifier.py`)
-- **Type**: Independent Oracle Verification.
+- **Type**: Strictly Read-Only Post-Condition Verifier.
 - **Function**:
-  - Two-tier verification: Action-level execution footprint check + deep downstream batch pipeline verification.
-  - Runs deep workflow verification (`env.run_workflow()`) only after all plan actions have completed.
-  - Injects `VerificationRecord` into audit trail with failed jobs telemetry.
+  - Reads `env.get_state()` only — never mutates the environment or calls `env.run_workflow()`.
+  - Verifies that at least one non-read-only remediation or `resume_workflow` action executed, validates `workflow_run_id` binding, and confirms all jobs completed with `JobStatus.SUCCESS`.
+  - Injects `VerificationRecord` into the audit trail with failed jobs telemetry.
 
 ### Node 5: Evidence-Based Replanner (`src/nova/nodes/replanner.py`)
 - **Type**: LLM Re-Diagnosis with Ground-Truth Telemetry.
 - **Function**:
   - Evaluates actual execution records and verification records without assuming previous remediation succeeded.
-  - Revises incorrect hypotheses if an action failed execution.
-  - Diagnoses newly surfaced downstream dependencies when previous remediation succeeded.
+  - Revises incorrect hypotheses if an action failed execution or postcondition checks.
+  - Diagnoses newly surfaced downstream dependencies when upstream remediation succeeded and `resume_workflow` exposed a downstream job failure.
   - Escalates immediately if unrecoverable data corruption is detected.
 
 ---
 
-## 4. Simulation Assumptions & Operational Distinctions
+## 4. Prototype Boundaries & Deferred Production Concerns (Milestone 11)
 
 > [!NOTE]
-> **Production vs. Simulation Note on Pipeline Re-execution (`env.run_workflow()`)**:
-> In a production enterprise orchestrator (e.g., BMC Control-M, Autosys), re-running an entire batch pipeline is an **operational side-effect** that writes to databases, consumes compute resources, and alters state.
-> In this mock environment, `MockWorkflowRunner.run_workflow()` serves as the synthetic oracle proving that the batch pipeline executes cleanly from start to finish without errors. In live external deployments, passive telemetry checks (service port health, status polling, log checks) are preferred before re-triggering pipelines.
+> **Explicit Prototype Scope & Remaining Limitations**:
+> - **Single Active Incident & Shared Environment**: `IncidentService` enforces a single active incident / pending approval against the shared `MockWorkflowRunner` (`409 Conflict` on concurrent triggers or `/scenarios/inject` resets). Per-run isolated workspaces are deferred until integration with a real executing ETL environment.
+> - **Read-Only Verification vs. Explicit Workflow Resumption**: `verifier_node` is strictly read-only (`env.get_state()`), and pipeline re-execution (`resume_workflow`) is an explicit planned `LOW_RISK` action.
+> - **Local Prototype Approvals & Auth**: RBAC validates the operator role submitted through FastAPI/Streamlit and rejects raw boolean or incomplete approval shortcuts, but enterprise caller authentication (JWT/OAuth/SSO) is deferred.
+> - **Persistence & Restart Recovery**: Automatic restart recovery of interrupted/in-flight approvals, distributed multi-worker coordination/leasing, and replacing `SqliteSaver`'s pickle fallback with a strict type-constrained serializer are deferred and not implemented in this prototype. Destructive operations are never automatically replayed after an uncertain execution outcome.
 
 ---
 

@@ -1,7 +1,11 @@
 from typing import Optional, Type
 from pydantic import BaseModel, Field
 
-from nova.environments.mock_workflow_runner import JobStatus, MockWorkflowRunner
+from nova.environments.mock_workflow_runner import (
+    JobStatus,
+    MockWorkflowRunner,
+    resolve_contained_path,
+)
 from nova.state import RiskLevel
 from nova.tools.base import BaseTool, ToolResult
 
@@ -61,6 +65,21 @@ class ReadJobLogsTool(BaseTool):
         self.env = env
 
     def _run(self, job_id: str, tail_lines: int = 50) -> ToolResult:
+        if not self.env.is_registered_job(job_id):
+            return ToolResult(
+                stdout="",
+                stderr=f"Error: Job ID '{job_id}' is not a registered workflow job.",
+                exit_code=1,
+                success=False,
+            )
+        safe_path = resolve_contained_path(self.env.logs_dir, f"{job_id}.log")
+        if safe_path is None:
+            return ToolResult(
+                stdout="",
+                stderr=f"Security: path traversal or symlink rejected for job_id '{job_id}'.",
+                exit_code=1,
+                success=False,
+            )
         log_content = self.env.read_job_log(job_id=job_id, tail_lines=tail_lines)
         if log_content.startswith("Error:"):
             return ToolResult(
@@ -88,6 +107,14 @@ class CheckServiceStatusTool(BaseTool):
         self.env = env
 
     def _run(self, service_name: str) -> ToolResult:
+        if not self.env.is_registered_service(service_name):
+            return ToolResult(
+                stdout="",
+                stderr=f"Error: Service '{service_name}' is not a registered service.",
+                exit_code=1,
+                success=False,
+                data={"service": service_name, "registered": False},
+            )
         status_info = self.env.check_service_status(service_name)
         is_healthy = status_info.get("healthy", False)
         status_label = status_info.get("status", "UNKNOWN")
@@ -112,15 +139,30 @@ class ClearLockfileTool(BaseTool):
         self.env = env
 
     def _run(self, lock_name: str, allow_idempotent: bool = True) -> ToolResult:
-        lock_path = self.env.locks_dir / lock_name
-        already_absent = not lock_path.exists()
-        if not already_absent and self.env.is_lock_active(lock_name):
+        # Atomic check-and-unlink inside MockWorkflowRunner._lock:
+        # validates registered lock ID, pathlib containment, symlink safety, and active worker ownership.
+        status_code, detail = self.env.clear_lock_atomic(lock_name)
+
+        if status_code == "REMOVED":
+            return ToolResult(
+                stdout=detail,
+                stderr="",
+                exit_code=0,
+                success=True,
+                data={"lock_name": lock_name, "removed": True, "idempotent_noop": False},
+            )
+        if status_code == "ALREADY_ABSENT" and allow_idempotent:
+            return ToolResult(
+                stdout=f"Lockfile '{lock_name}' is already absent. Idempotent pre-condition satisfied.",
+                stderr="",
+                exit_code=0,
+                success=True,
+                data={"lock_name": lock_name, "removed": False, "idempotent_noop": True},
+            )
+        if status_code == "ACTIVE_LOCK":
             return ToolResult(
                 stdout="",
-                stderr=(
-                    f"Safety Guard: Refusing to delete active lockfile '{lock_name}' "
-                    "owned by an active worker process."
-                ),
+                stderr=detail,
                 exit_code=1,
                 success=False,
                 data={
@@ -129,26 +171,9 @@ class ClearLockfileTool(BaseTool):
                     "active_lock_protected": True,
                 },
             )
-        removed = self.env.clear_lock(lock_name)
-        if removed:
-            return ToolResult(
-                stdout=f"Successfully removed lockfile: '{lock_name}'",
-                stderr="",
-                exit_code=0,
-                success=True,
-                data={"lock_name": lock_name, "removed": True, "idempotent_noop": False},
-            )
-        if already_absent and allow_idempotent:
-            return ToolResult(
-                stdout=f"Lockfile '{lock_name}' is already absent. Idempotent pre-condition satisfied.",
-                stderr="",
-                exit_code=0,
-                success=True,
-                data={"lock_name": lock_name, "removed": False, "idempotent_noop": True},
-            )
         return ToolResult(
             stdout="",
-            stderr=f"Lockfile '{lock_name}' was not found or could not be removed",
+            stderr=detail,
             exit_code=1,
             success=False,
             data={"lock_name": lock_name, "removed": False, "idempotent_noop": False},
@@ -165,6 +190,15 @@ class RestartServiceTool(BaseTool):
         self.env = env
 
     def _run(self, service_name: str, allow_idempotent: bool = True) -> ToolResult:
+        if not self.env.is_registered_service(service_name):
+            return ToolResult(
+                stdout="",
+                stderr=f"Error: Service '{service_name}' is not a registered service.",
+                exit_code=1,
+                success=False,
+                data={"service_name": service_name, "restarted": False, "unknown_service": True},
+            )
+
         status_info = self.env.check_service_status(service_name)
         is_already_healthy = status_info.get("healthy", False)
 
@@ -188,7 +222,7 @@ class RestartServiceTool(BaseTool):
             )
         return ToolResult(
             stdout="",
-            stderr=f"Failed to restart service '{service_name}'. Service not found in environment.",
+            stderr=f"Failed to restart service '{service_name}'. No active workflow state or service not found.",
             exit_code=1,
             success=False,
             data={"service_name": service_name, "restarted": False, "idempotent_noop": False},
@@ -206,17 +240,40 @@ class ResumeWorkflowTool(BaseTool):
 
     def _run(self, workflow_id: str) -> ToolResult:
         try:
+            current_state = self.env.get_state()
+            if current_state is None:
+                return ToolResult(
+                    stdout="",
+                    stderr="No active workflow state found. Inject a scenario before resuming.",
+                    exit_code=1,
+                    success=False,
+                )
+            if current_state.workflow_id != workflow_id:
+                return ToolResult(
+                    stdout="",
+                    stderr=(
+                        f"Workflow ID mismatch: requested '{workflow_id}' but active workflow is "
+                        f"'{current_state.workflow_id}'. Cannot resume an unknown or inactive workflow."
+                    ),
+                    exit_code=1,
+                    success=False,
+                    data={
+                        "requested_workflow_id": workflow_id,
+                        "active_workflow_id": current_state.workflow_id,
+                    },
+                )
+
             state = self.env.run_workflow()
-            all_successful = all(job.status == "SUCCESS" for job in state.jobs.values())
-            failed_jobs = [job.id for job in state.jobs.values() if job.status == "FAILED"]
+            all_successful = all(job.status == JobStatus.SUCCESS for job in state.jobs.values())
+            failed_jobs = [job.id for job in state.jobs.values() if job.status == JobStatus.FAILED]
 
             if all_successful:
                 return ToolResult(
-                    stdout=f"Workflow '{workflow_id}' completed successfully with all jobs passing.",
+                    stdout=f"Workflow '{workflow_id}' (run '{state.run_id}') completed successfully with all jobs passing.",
                     stderr="",
                     exit_code=0,
                     success=True,
-                    data={"workflow_id": workflow_id, "failed_jobs": []},
+                    data={"workflow_id": workflow_id, "run_id": state.run_id, "failed_jobs": []},
                 )
             else:
                 return ToolResult(
@@ -224,7 +281,7 @@ class ResumeWorkflowTool(BaseTool):
                     stderr=f"Unresolved failure in jobs: {failed_jobs}",
                     exit_code=1,
                     success=False,
-                    data={"workflow_id": workflow_id, "failed_jobs": failed_jobs},
+                    data={"workflow_id": workflow_id, "run_id": state.run_id, "failed_jobs": failed_jobs},
                 )
         except Exception as e:
             return ToolResult(
@@ -254,9 +311,18 @@ class GetWorkflowStatusTool(BaseTool):
                 success=True,
                 data={"status": "NO_STATE"},
             )
+        if workflow_id is not None and workflow_id != state.workflow_id:
+            return ToolResult(
+                stdout="",
+                stderr=f"Workflow ID '{workflow_id}' does not match active workflow '{state.workflow_id}'.",
+                exit_code=1,
+                success=False,
+                data={"requested_workflow_id": workflow_id, "active_workflow_id": state.workflow_id},
+            )
 
         summary_lines = [
             f"Workflow ID: {state.workflow_id} ({state.name})",
+            f"Run ID: {state.run_id}",
             f"Scenario: {state.scenario.value}",
             "Job States:",
         ]
@@ -281,6 +347,7 @@ class GetWorkflowStatusTool(BaseTool):
             success=True,
             data={
                 "workflow_id": state.workflow_id,
+                "run_id": state.run_id,
                 "scenario": state.scenario.value,
                 "failed_jobs": failed_jobs,
                 "active_locks": active_locks,
@@ -303,10 +370,10 @@ class InspectJobDependenciesTool(BaseTool):
         jobs = state.jobs if state else {j.id: j for j in self.env.DEFAULT_JOBS}
 
         if job_id:
-            if job_id not in jobs:
+            if not self.env.is_registered_job(job_id) or job_id not in jobs:
                 return ToolResult(
                     stdout="",
-                    stderr=f"Job '{job_id}' not found in workflow definition.",
+                    stderr=f"Job '{job_id}' is not a registered workflow job.",
                     exit_code=1,
                     success=False,
                 )
@@ -355,9 +422,23 @@ class InspectLockfilesTool(BaseTool):
             )
 
         if lock_name:
-            target = locks_dir / lock_name
-            if target.exists():
-                content = target.read_text(encoding="utf-8").strip()
+            if not self.env.is_registered_lock(lock_name):
+                return ToolResult(
+                    stdout="",
+                    stderr=f"Lockfile '{lock_name}' is not a registered lock resource.",
+                    exit_code=1,
+                    success=False,
+                )
+            safe_path = resolve_contained_path(locks_dir, lock_name)
+            if safe_path is None:
+                return ToolResult(
+                    stdout="",
+                    stderr=f"Security: path traversal or symlink rejected for lock_name '{lock_name}'.",
+                    exit_code=1,
+                    success=False,
+                )
+            if safe_path.exists():
+                content = safe_path.read_text(encoding="utf-8").strip()
                 return ToolResult(
                     stdout=f"Lockfile '{lock_name}' is PRESENT. Content: '{content}'",
                     stderr="",
@@ -373,7 +454,11 @@ class InspectLockfilesTool(BaseTool):
                 data={"lock_name": lock_name, "present": False},
             )
 
-        lock_files = list(locks_dir.glob("*.lock"))
+        lock_files = [
+            lf
+            for lf in locks_dir.glob("*.lock")
+            if not lf.is_symlink() and self.env.is_registered_lock(lf.name)
+        ]
         if not lock_files:
             return ToolResult(
                 stdout="No active lockfiles found in locks directory.",
@@ -395,5 +480,3 @@ class InspectLockfilesTool(BaseTool):
             success=True,
             data={"locks": [lf.name for lf in lock_files]},
         )
-
-

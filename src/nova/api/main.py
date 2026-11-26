@@ -219,9 +219,8 @@ def inject_scenario(
             detail=f"Invalid scenario '{request.scenario}'. Must be one of: {valid_scenarios}",
         )
 
-    # Inject scenario and run initial batch to create failure condition
-    service.env.inject_scenario(scenario_type)
-    state = service.env.run_workflow()
+    # Inject scenario under IncidentService lock (blocks reset during active incident / pending approval)
+    state = service.inject_scenario(scenario_type)
 
     failed_job = None
     error_msg = None
@@ -233,6 +232,7 @@ def inject_scenario(
 
     return ScenarioInjectResponse(
         workflow_id=state.workflow_id,
+        run_id=state.run_id,
         scenario=request.scenario,
         failed_job=failed_job,
         error_message=error_msg,

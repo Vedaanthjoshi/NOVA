@@ -4,10 +4,56 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
+
+# ---------------------------------------------------------------------------
+# Registered resource identifiers and safe containment (M11)
+# ---------------------------------------------------------------------------
+REGISTERED_SERVICES = frozenset({"reporting_warehouse_service"})
+REGISTERED_JOB_IDS = frozenset({
+    "JOB_01_EXTRACT",
+    "JOB_02_TRANSFORM",
+    "JOB_03_LOAD",
+    "JOB_04_REPORT",
+})
+REGISTERED_LOCK_IDS = frozenset({"transform_job.lock"})
+
+
+def resolve_contained_path(base_dir: Path, relative_name: str) -> Optional[Path]:
+    """
+    Safely resolves a single filename inside `base_dir` using pathlib checks.
+
+    - Rejects empty names, path separators, drive letters, and '..' segments.
+    - Rejects symlinks to prevent workspace escape via symlink targets.
+    - Enforces `resolved.is_relative_to(base_resolved)` (never string prefix matching).
+    """
+    if not relative_name or not isinstance(relative_name, str):
+        return None
+    p = Path(relative_name)
+    if (
+        p.name != relative_name
+        or relative_name in (".", "..")
+        or "/" in relative_name
+        or "\\" in relative_name
+    ):
+        return None
+    candidate = base_dir / relative_name
+    if candidate.is_symlink():
+        return None
+    try:
+        base_resolved = base_dir.resolve()
+        resolved = candidate.resolve(strict=False)
+    except OSError:
+        return None
+    if resolved == base_resolved or not resolved.is_relative_to(base_resolved):
+        return None
+    if resolved.parent != base_resolved:
+        return None
+    return resolved
 
 
 class JobStatus(str, Enum):
@@ -37,6 +83,7 @@ class JobDefinition(BaseModel):
 
 class WorkflowState(BaseModel):
     workflow_id: str
+    run_id: str = Field(default_factory=lambda: f"RUN_{uuid.uuid4().hex[:12].upper()}")
     name: str
     scenario: ScenarioType
     jobs: Dict[str, JobDefinition]
@@ -92,6 +139,29 @@ class MockWorkflowRunner:
             self.logs_dir.mkdir(parents=True, exist_ok=True)
             self.locks_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- Registered Resource Helpers (M11) ---
+
+    def is_registered_job(self, job_id: str) -> bool:
+        state = self.get_state()
+        valid = set(REGISTERED_JOB_IDS)
+        if state:
+            valid.update(state.jobs.keys())
+        return job_id in valid
+
+    def is_registered_service(self, service_name: str) -> bool:
+        state = self.get_state()
+        valid = set(REGISTERED_SERVICES)
+        if state:
+            valid.update(state.services.keys())
+        return service_name in valid
+
+    def is_registered_lock(self, lock_name: str) -> bool:
+        state = self.get_state()
+        valid = set(REGISTERED_LOCK_IDS)
+        if state:
+            valid.update(state.active_locks)
+        return lock_name in valid
+
     def reset(self) -> None:
         """Completely resets all files, logs, and state."""
         with self._lock:
@@ -131,15 +201,21 @@ class MockWorkflowRunner:
         """Appends log entry to the job's log file."""
         with self._lock:
             self.logs_dir.mkdir(parents=True, exist_ok=True)
-            log_file = self.logs_dir / f"{job_id}.log"
+            log_file = resolve_contained_path(self.logs_dir, f"{job_id}.log")
+            if log_file is None:
+                raise ValueError(f"Unsafe log path for job_id '{job_id}'.")
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(f"[{timestamp}] {message}\n")
 
     def read_job_log(self, job_id: str, tail_lines: int = 50) -> str:
-        """Reads the latest lines from a job's log file."""
+        """Reads the latest lines from a job's log file with registry + pathlib containment."""
         with self._lock:
-            log_file = self.logs_dir / f"{job_id}.log"
+            if not self.is_registered_job(job_id):
+                return f"Error: Job ID '{job_id}' is not a registered workflow job."
+            log_file = resolve_contained_path(self.logs_dir, f"{job_id}.log")
+            if log_file is None:
+                return f"Error: Path traversal or symlink rejected for job_id '{job_id}'."
             if not log_file.exists():
                 return f"Error: No log file found for job '{job_id}'."
             with open(log_file, "r", encoding="utf-8") as f:
@@ -175,6 +251,7 @@ class MockWorkflowRunner:
 
             state = WorkflowState(
                 workflow_id="WF_NIGHTLY_BATCH_1001",
+                run_id=f"RUN_{uuid.uuid4().hex[:12].upper()}",
                 name="Nightly Financial Ingestion Pipeline",
                 scenario=scenario,
                 jobs=jobs_dict,
@@ -231,6 +308,7 @@ class MockWorkflowRunner:
                     self._write_log(job_id, "SUCCESS: Extraction completed cleanly.")
                     job.status = JobStatus.SUCCESS
                     job.exit_code = 0
+                    job.error_message = None
 
             # Execute Job 02: Transform
             elif job_id == "JOB_02_TRANSFORM":
@@ -250,6 +328,7 @@ class MockWorkflowRunner:
                     self._write_log(job_id, "SUCCESS: Transformed 45,210 records into 12 summary partitions.")
                     job.status = JobStatus.SUCCESS
                     job.exit_code = 0
+                    job.error_message = None
 
             # Execute Job 03: Load
             elif job_id == "JOB_03_LOAD":
@@ -268,6 +347,7 @@ class MockWorkflowRunner:
                     self._write_log(job_id, "SUCCESS: 12 partitions successfully committed to warehouse tables.")
                     job.status = JobStatus.SUCCESS
                     job.exit_code = 0
+                    job.error_message = None
 
             # Execute Job 04: Report
             elif job_id == "JOB_04_REPORT":
@@ -275,6 +355,7 @@ class MockWorkflowRunner:
                 self._write_log(job_id, "SUCCESS: Executive scorecard published to notification stream.")
                 job.status = JobStatus.SUCCESS
                 job.exit_code = 0
+                job.error_message = None
 
         self._save_state(state)
         return state
@@ -282,32 +363,66 @@ class MockWorkflowRunner:
     # --- Remediation Actions Callable by NOVA's Tools ---
 
     def is_lock_active(self, lock_name: str) -> bool:
-        """Checks whether a lockfile on disk belongs to an active live worker."""
+        """Checks whether a registered lockfile on disk belongs to an active live worker."""
         with self._lock:
-            lock_path = self.locks_dir / lock_name
-            if not lock_path.exists():
+            if not self.is_registered_lock(lock_name):
+                return False
+            lock_path = resolve_contained_path(self.locks_dir, lock_name)
+            if lock_path is None or not lock_path.exists():
                 return False
             content = lock_path.read_text(encoding="utf-8", errors="ignore").upper()
             if "ORPHANED" in content or "STALE" in content:
                 return False
             return "STATUS=ACTIVE_WORKER" in content or "HEARTBEAT=RECENT" in content
 
-    def clear_lock(self, lock_name: str) -> bool:
-        """Removes a specified lockfile from the locks directory."""
+    def clear_lock_atomic(self, lock_name: str) -> Tuple[str, str]:
+        """
+        Atomically checks registration, containment, existence, and active-worker
+        ownership under self._lock before unlinking.
+
+        Returns (status_code, detail):
+          - ("REJECTED", reason)
+          - ("ACTIVE_LOCK", reason)
+          - ("ALREADY_ABSENT", detail)
+          - ("REMOVED", detail)
+        """
         with self._lock:
-            lock_path = self.locks_dir / lock_name
-            if lock_path.exists():
-                lock_path.unlink()
-                state = self.get_state()
-                if state and lock_name in state.active_locks:
-                    state.active_locks.remove(lock_name)
-                    self._save_state(state)
-                return True
-            return False
+            if not self.is_registered_lock(lock_name):
+                return ("REJECTED", f"Lockfile '{lock_name}' is not a registered lock resource.")
+            lock_path = resolve_contained_path(self.locks_dir, lock_name)
+            if lock_path is None:
+                return ("REJECTED", f"Security: path traversal or symlink rejected for '{lock_name}'.")
+            if not lock_path.exists():
+                return ("ALREADY_ABSENT", f"Lockfile '{lock_name}' is already absent.")
+
+            content = lock_path.read_text(encoding="utf-8", errors="ignore").upper()
+            is_stale = "ORPHANED" in content or "STALE" in content
+            is_active = (not is_stale) and (
+                "STATUS=ACTIVE_WORKER" in content or "HEARTBEAT=RECENT" in content
+            )
+            if is_active:
+                return (
+                    "ACTIVE_LOCK",
+                    f"Safety Guard: Refusing to delete active lockfile '{lock_name}' owned by an active worker process.",
+                )
+
+            lock_path.unlink()
+            state = self.get_state()
+            if state and lock_name in state.active_locks:
+                state.active_locks.remove(lock_name)
+                self._save_state(state)
+            return ("REMOVED", f"Successfully removed lockfile: '{lock_name}'")
+
+    def clear_lock(self, lock_name: str) -> bool:
+        """Removes a registered stale lockfile from the locks directory."""
+        status_code, _ = self.clear_lock_atomic(lock_name)
+        return status_code == "REMOVED"
 
     def restart_service(self, service_name: str) -> bool:
-        """Simulates restarting or bringing an offline service back online."""
+        """Simulates restarting or bringing an offline registered service back online."""
         with self._lock:
+            if not self.is_registered_service(service_name):
+                return False
             state = self.get_state()
             if not state:
                 return False
@@ -316,16 +431,23 @@ class MockWorkflowRunner:
             return True
 
     def check_service_status(self, service_name: str) -> dict:
-        """Returns the operational health status of a service."""
+        """Returns the operational health status of a registered service."""
         with self._lock:
+            if not self.is_registered_service(service_name):
+                return {
+                    "service": service_name,
+                    "status": "UNREGISTERED",
+                    "healthy": False,
+                    "registered": False,
+                }
             state = self.get_state()
             if not state:
-                return {"service": service_name, "status": "UNKNOWN"}
+                return {"service": service_name, "status": "UNKNOWN", "healthy": False, "registered": True}
             is_running = state.services.get(service_name, False)
             return {
                 "service": service_name,
                 "status": "RUNNING" if is_running else "STOPPED",
                 "port": 5432 if "warehouse" in service_name else 8080,
                 "healthy": is_running,
+                "registered": True,
             }
-

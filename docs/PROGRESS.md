@@ -1,8 +1,8 @@
 # Project Progress Tracker: NOVA
 
-**Current Date**: 2026-11-25  
-**Current Phase**: Final Acceptance & Submission Readiness  
-**Current Milestone**: Milestone 10 — Final Integration, Targeted Hardening, Observability & Submission Readiness (Completed)
+**Current Date**: 2026-11-26  
+**Current Phase**: Milestone 11 — Execution & Safety Correctness (Completed)  
+**Current Milestone**: Milestone 11 — Execution & Safety Correctness (Reduced Prototype Scope)
 
 ---
 
@@ -186,14 +186,24 @@
   - **Verification**:
     - Headless Streamlit `AppTest` UI suite (`tests/integration/test_streamlit_ui.py`), Milestone 10 hardening integration suite (`tests/integration/test_milestone10_hardening.py`), observability unit suite (`tests/unit/test_observability.py`), and live full-stack smoke test (`uvicorn` + `streamlit` + `SqliteSaver` + live `gemini-3.5-flash-lite`).
 
+- [x] **Milestone 11: Execution & Safety Correctness (Reduced Prototype Scope)**:
+  - **Read-Only Verification & Explicit Resumption** (`src/nova/nodes/verifier.py`, `src/nova/llm/client.py`, `src/nova/nodes/planner.py`, `src/nova/nodes/replanner.py`): Replaced `env.run_workflow()` in `verifier_node` with strictly read-only `env.get_state()` inspection; added `resume_workflow` as an explicit planned action in `MockLLMClient` and `GeminiLLMClient` prompts; updated `MockLLMClient` and `GeminiLLMClient` replanning logic to distinguish remediation-tool failures from downstream `resume_workflow` halts.
+  - **Deterministic Postconditions & Approval Hardening** (`src/nova/nodes/executor.py`): Added deterministic postcondition verification (`clear_lockfile`, `restart_service`, `resume_workflow`), pre-interrupt destructive parameter validation, and rejection of raw boolean and incomplete-dict approval shortcuts when `require_approval=True`.
+  - **Pathlib Containment & Registered Identifiers** (`src/nova/environments/mock_workflow_runner.py`, `src/nova/tools/workflow_tools.py`): Implemented `resolve_contained_path` using `Path.is_relative_to()` with symlink rejection, atomic lock ownership checks under `MockWorkflowRunner._lock`, and strict rejection of unregistered job, service, lock, and workflow IDs.
+  - **Plan Schema & Recovery State** (`src/nova/llm/schemas.py`, `src/nova/environments/mock_workflow_runner.py`): Rejected empty non-escalating plans and contradictory escalating plans with actions; cleared `job.error_message` on successful job recovery.
+  - **Single Active Incident & Run Binding** (`src/nova/state.py`, `src/nova/api/service.py`, `src/nova/api/main.py`, `src/nova/api/schemas.py`, `src/nova/nodes/triage.py`): Added immutable `WorkflowState.run_id` bound across triage, approval, execution, and verification; enforced a single active incident and blocked `/scenarios/inject` (`409 Conflict`) during active remediation or pending approval.
+  - **Verification**: `python -m pytest -q` -> **134 passed** (including 14 new regression tests in `tests/integration/test_milestone11_correctness.py`).
+  - **Deferred Limitations**: Enterprise caller auth (JWT/OAuth), automatic restart recovery of interrupted/in-flight approvals, distributed multi-worker locking, advanced approval command-table persistence, and replacing `SqliteSaver` pickle serialization remain deferred for prototype scope.
+
 ---
 
 ## 2. Test Execution & Verification Status
-- **Date**: 2026-11-25
-- **Command**: `python -m pytest` (API/UI `TestClient` suites run outside Windows sandbox socket restrictions)
-- **Results**: **120 passed** (100% pass rate).
+- **Date**: 2026-11-26
+- **Command**: `python -m pytest -q` (API/UI `TestClient` suites run outside Windows sandbox socket restrictions)
+- **Results**: **134 passed** (100% pass rate).
 - Breakdown:
   - `test_streamlit_ui.py`: 2 tests (`AppTest` widget flows, dashboard refresh, custom `UNKNOWN` submission, HITL approve & reject)
+  - `test_milestone11_correctness.py`: 14 tests (read-only verifier, read-only plan non-resolution, explicit `resume_workflow`, executor postconditions, `pathlib` containment & symlink rejection, unregistered resource/workflow ID rejection, empty/contradictory plan schemas, stale error clearing, single active incident & scenario reset lock, `run_id` binding, permissive approval rejection, stubbed Gemini plan/replan prompts)
   - `test_milestone10_hardening.py`: 10 tests (active lockfile protection, false-positive alert, cascading replanning via API, replay/duplicate/hash hardening, backend restart & history retrieval, LLM failure handling, concurrent simulator thread safety, interrupted task detection, telemetry preservation across restart/approval, diagnostic `check_service_status` exit-code handling)
   - `test_ui_gateway.py`: 5 tests
   - `test_api_gateway.py`: 9 tests
@@ -221,5 +231,5 @@
 ---
 
 ## 4. Current State & Exact Next Step (Handoff)
-- **Current State**: Milestone 10 is complete. Feature scope is frozen and NOVA is packaged, hardened, documented, and submission-ready for technical interview walkthroughs.
-- **Next Action (Optional User Verification)**: Launch locally with `python scripts/start_nova.py` and open `http://127.0.0.1:8501` in a browser to visually inspect the Streamlit dashboard.
+- **Current State**: Milestone 11 (reduced prototype scope) is complete and verified with 134/134 passing tests.
+- **Next Action**: Integrate an isolated executing Python/PostgreSQL ETL environment against NOVA's hardened execution, approval, and read-only verification boundaries.

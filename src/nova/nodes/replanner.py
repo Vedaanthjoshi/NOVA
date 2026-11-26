@@ -61,10 +61,21 @@ def create_replanner_node(env: MockWorkflowRunner, llm: BaseLLMClient):
 
         original_target = state.get("target_service", "")
 
-        # Extract which tool was used in the last execution
+        # Extract which remediation tool was used in the last execution cycle.
+        # If resume_workflow ran after a remediation tool and surfaced a downstream failure,
+        # identify the preceding remediation tool so replanning context stays clear.
         first_action_taken = "unknown_action"
         if execution_history:
-            first_action_taken = execution_history[-1].tool_name
+            last_exec = execution_history[-1]
+            if (
+                last_exec.tool_name == "resume_workflow"
+                and not last_exec.success
+                and len(execution_history) >= 2
+                and execution_history[-2].success
+            ):
+                first_action_taken = execution_history[-2].tool_name
+            else:
+                first_action_taken = last_exec.tool_name
 
         # Extract the new failing job from verification evidence
         new_target = original_target

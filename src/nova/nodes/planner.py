@@ -1,7 +1,8 @@
 import hashlib
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+from nova.environments.mock_workflow_runner import MockWorkflowRunner
 from nova.llm.client import BaseLLMClient
 from nova.llm.schemas import PlannedActionSchema
 from nova.observability import incident_context, log_event, redact_secrets, telemetry
@@ -44,7 +45,7 @@ AVAILABLE_TOOLS_FOR_LLM: List[Dict[str, Any]] = [
     {
         "name": "resume_workflow",
         "description": "Signals the batch orchestrator to retry the pipeline from last checkpoint.",
-        "parameters": {},
+        "parameters": {"workflow_id": "str — exact workflow_id of the active workflow run"},
         "risk_level": "LOW_RISK",
     },
     {
@@ -95,8 +96,8 @@ def _schema_to_domain(
     )
 
 
-def create_planner_node(llm: BaseLLMClient):
-    """Factory returning a planner node bound to an LLM client."""
+def create_planner_node(llm: BaseLLMClient, env: Optional[MockWorkflowRunner] = None):
+    """Factory returning a planner node bound to an LLM client and optional environment."""
 
     def planner_node(state: NovaGraphState) -> Dict[str, Any]:
         incident_id = state.get("incident_id", "")
@@ -114,6 +115,12 @@ def create_planner_node(llm: BaseLLMClient):
             if is_rec is None:
                 is_rec = _infer_recoverability(triage_summary, hypothesis)
 
+            active_workflow_id = state.get("workflow_id")
+            if not active_workflow_id and env is not None:
+                wf_state = env.get_state()
+                if wf_state is not None:
+                    active_workflow_id = wf_state.workflow_id
+
             proxy_triage = TriageResult(
                 failure_type=failure_type,
                 implicated_resource=implicated_resource,
@@ -121,6 +128,7 @@ def create_planner_node(llm: BaseLLMClient):
                 root_cause_hypothesis=hypothesis,
                 is_recoverable=is_rec,
                 confidence="HIGH",
+                workflow_id=active_workflow_id,
             )
 
             try:
@@ -140,11 +148,40 @@ def create_planner_node(llm: BaseLLMClient):
                     "final_summary": reason,
                 }
 
+            # Contradictory plan check (defense-in-depth beyond Pydantic)
+            if planner_result.is_escalation and planner_result.actions:
+                reason = (
+                    "Planning failed: Contradictory plan returned is_escalation=True alongside non-empty actions."
+                )
+                telemetry.record_terminal_reason(incident_id, "FAILED", reason)
+                log_event(logger, logging.ERROR, "planner_contradictory_plan", reason)
+                return {
+                    "plan": [],
+                    "current_action_index": 0,
+                    "status": IncidentStatus.FAILED,
+                    "final_summary": reason,
+                }
+
             # Escalation path: LLM determined no automated fix is possible
             if planner_result.is_escalation:
                 reason = f"Incident Escalated: {planner_result.escalation_reason}"
                 telemetry.record_terminal_reason(incident_id, "ESCALATED", reason)
                 log_event(logger, logging.WARNING, "planner_escalated", reason, failure_type=failure_type)
+                return {
+                    "plan": [],
+                    "current_action_index": 0,
+                    "status": IncidentStatus.ESCALATED,
+                    "final_summary": reason,
+                }
+
+            # Empty non-escalating plan guard: never transition to EXECUTING with zero actions
+            if not planner_result.actions:
+                reason = (
+                    "Planning failed: Planner returned an empty non-escalating remediation plan. "
+                    "Escalating safely instead of entering EXECUTING with no actions."
+                )
+                telemetry.record_terminal_reason(incident_id, "ESCALATED", reason)
+                log_event(logger, logging.WARNING, "planner_empty_plan_rejected", reason)
                 return {
                     "plan": [],
                     "current_action_index": 0,

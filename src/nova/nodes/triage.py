@@ -66,6 +66,15 @@ def create_triage_node(
         step_number = state.get("investigation_steps", 0) + 1
         max_steps = state.get("max_investigation_steps", 5)
 
+        # M11: Capture active workflow_id / workflow_run_id on first investigation step if unbound
+        bound_wf_id = state.get("workflow_id")
+        bound_run_id = state.get("workflow_run_id")
+        if not bound_run_id:
+            wf_state = env.get_state()
+            if wf_state is not None:
+                bound_wf_id = bound_wf_id or wf_state.workflow_id
+                bound_run_id = wf_state.run_id
+
         # Budget Check: Bounded investigation loop
         if step_number > max_steps:
             reason = (
@@ -228,6 +237,8 @@ def create_triage_node(
                 "diagnostic_history": [rec],
                 "investigation_evidence": [evidence_line],
                 "investigation_steps": step_number,
+                "workflow_id": bound_wf_id,
+                "workflow_run_id": bound_run_id,
                 "status": IncidentStatus.TRIAGING,
             }
 
@@ -268,6 +279,8 @@ def create_triage_node(
                 "triage_summary": diag.triage_summary,
                 "root_cause_hypothesis": diag.root_cause_hypothesis,
                 "target_service": new_target or diag.implicated_resource,
+                "workflow_id": bound_wf_id,
+                "workflow_run_id": bound_run_id,
                 "status": IncidentStatus.PLANNING,
             }
 

@@ -85,6 +85,13 @@ def test_multistep_plan_executes_in_correct_order(env):
             rationale="Restart reporting warehouse database",
             expected_outcome="Service is operational",
         ),
+        PlannedActionSchema(
+            tool_name="resume_workflow",
+            parameters={"workflow_id": "WF_NIGHTLY_BATCH_1001"},
+            risk_level=RiskLevel.LOW_RISK,
+            rationale="Re-execute batch pipeline after fixes",
+            expected_outcome="All workflow jobs succeed",
+        ),
     ]
 
     llm = MultiStepMockLLM(plan_actions=actions)
@@ -107,9 +114,9 @@ def test_multistep_plan_executes_in_correct_order(env):
     # 1. State must be fully resolved
     assert result["status"] == IncidentStatus.RESOLVED
 
-    # 2. Exactly 3 actions executed
+    # 2. Exactly 4 actions executed
     exec_history = result["execution_history"]
-    assert len(exec_history) == 3
+    assert len(exec_history) == 4
 
     # 3. Actions executed in exact declared order
     assert exec_history[0].tool_name == "inspect_lockfiles"
@@ -124,8 +131,12 @@ def test_multistep_plan_executes_in_correct_order(env):
     assert exec_history[2].action_id == "ACT_01_03"
     assert exec_history[2].success is True
 
-    # 4. current_action_index reached 3
-    assert result["current_action_index"] == 3
+    assert exec_history[3].tool_name == "resume_workflow"
+    assert exec_history[3].action_id == "ACT_01_04"
+    assert exec_history[3].success is True
+
+    # 4. current_action_index reached 4
+    assert result["current_action_index"] == 4
 
     # 5. Verification history confirms resolution
     assert len(result["verification_history"]) >= 1
@@ -236,6 +247,13 @@ def test_multistep_plan_hitl_checkpoints_and_intermediate_resumption(env):
             rationale="Restart database",
             expected_outcome="Database online",
         ),
+        PlannedActionSchema(
+            tool_name="resume_workflow",
+            parameters={"workflow_id": "WF_NIGHTLY_BATCH_1001"},
+            risk_level=RiskLevel.LOW_RISK,
+            rationale="Resume workflow after fixes",
+            expected_outcome="Workflow succeeds",
+        ),
     ]
 
     llm = MultiStepMockLLM(plan_actions=actions)
@@ -312,10 +330,10 @@ def test_multistep_plan_hitl_checkpoints_and_intermediate_resumption(env):
 
     final_result = graph.invoke(Command(resume=approval_2), config=thread_config)
 
-    # All 3 actions completed and incident resolved
+    # All 4 actions completed and incident resolved
     assert final_result["status"] == IncidentStatus.RESOLVED
-    assert len(final_result["execution_history"]) == 3
-    assert final_result["current_action_index"] == 3
+    assert len(final_result["execution_history"]) == 4
+    assert final_result["current_action_index"] == 4
 
 
 def test_multistep_plan_intermediate_rejection_halts_without_subsequent_actions(env):
@@ -346,6 +364,13 @@ def test_multistep_plan_intermediate_rejection_halts_without_subsequent_actions(
             risk_level=RiskLevel.DESTRUCTIVE,
             rationale="Restart database",
             expected_outcome="Database online",
+        ),
+        PlannedActionSchema(
+            tool_name="resume_workflow",
+            parameters={"workflow_id": "WF_NIGHTLY_BATCH_1001"},
+            risk_level=RiskLevel.LOW_RISK,
+            rationale="Resume workflow after fixes",
+            expected_outcome="Workflow succeeds",
         ),
     ]
 

@@ -114,17 +114,26 @@ def test_hitl_destructive_action_approved_and_resumed(mock_env: MockWorkflowRunn
     graph.invoke(initial_state, thread_config)
     assert (mock_env.locks_dir / "transform_job.lock").exists()
 
-    # Step 2: Operator approves via Command(resume=...)
+    # Step 2: Operator approves via Command(resume=...) with explicit operator identity & role
     final_state = graph.invoke(
-        Command(resume={"approved": True, "notes": "Approved by SRE on call"}),
+        Command(
+            resume={
+                "approved": True,
+                "approver_id": "sre_oncall_01",
+                "approver_role": "SRE_LEAD",
+                "notes": "Approved by SRE on call",
+            }
+        ),
         thread_config,
     )
 
     # Step 3: Assert full successful resolution
     assert final_state["status"] == IncidentStatus.RESOLVED
-    assert len(final_state["execution_history"]) == 1
+    assert len(final_state["execution_history"]) == 2
     assert final_state["execution_history"][0].tool_name == "clear_lockfile"
     assert final_state["execution_history"][0].success is True
+    assert final_state["execution_history"][1].tool_name == "resume_workflow"
+    assert final_state["execution_history"][1].success is True
     assert final_state["verification_history"][0].passed is True
 
     # Verify physical environment
@@ -243,14 +252,23 @@ def test_hitl_sqlite_persistence_across_process_restart(mock_env: MockWorkflowRu
         assert len(reloaded_state.tasks[0].interrupts) == 1
         assert reloaded_state.tasks[0].interrupts[0].value["tool_name"] == "clear_lockfile"
 
-        # Resume execution on the fresh process
+        # Resume execution on the fresh process with explicit operator identity & role
         final_state = graph2.invoke(
-            Command(resume={"approved": True, "notes": "Authorized post-restart"}),
+            Command(
+                resume={
+                    "approved": True,
+                    "approver_id": "sre_restart_01",
+                    "approver_role": "SRE_LEAD",
+                    "notes": "Authorized post-restart",
+                }
+            ),
             thread_config,
         )
 
         assert final_state["status"] == IncidentStatus.RESOLVED
-        assert len(final_state["execution_history"]) == 1
+        assert len(final_state["execution_history"]) == 2
+        assert final_state["execution_history"][0].tool_name == "clear_lockfile"
+        assert final_state["execution_history"][1].tool_name == "resume_workflow"
         assert final_state["verification_history"][0].passed is True
 
         saver2.close()
