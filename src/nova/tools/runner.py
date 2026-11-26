@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from nova.environments.mock_workflow_runner import MockWorkflowRunner
 from nova.observability import log_event, telemetry
@@ -46,6 +46,34 @@ class ToolRunner:
     def is_tool_allowed(self, tool_name: str) -> bool:
         """Returns True if the tool exists in the approved registry."""
         return tool_name in self._registry
+
+    def describe_tools(self, risk_filter: Optional[RiskLevel] = None) -> List[Dict[str, Any]]:
+        """
+        Dynamically generates tool catalog descriptors (name, description, risk_level,
+        and parameter schema) directly from the active ToolRunner registry.
+        """
+        catalog: List[Dict[str, Any]] = []
+        for name, tool in self._registry.items():
+            if risk_filter is not None and tool.risk_level != risk_filter:
+                continue
+            schema = tool.args_schema.model_json_schema()
+            props = schema.get("properties", {})
+            required = set(schema.get("required", []))
+            params: Dict[str, str] = {}
+            for param_name, meta in props.items():
+                p_type = meta.get("type", "any")
+                p_desc = meta.get("description", "")
+                req_tag = "required" if param_name in required else "optional"
+                params[param_name] = f"{p_type} ({req_tag}) — {p_desc}".strip(" —")
+            catalog.append(
+                {
+                    "name": name,
+                    "description": tool.description,
+                    "parameters": params,
+                    "risk_level": tool.risk_level.value,
+                }
+            )
+        return catalog
 
     def execute(self, action: PlannedAction) -> ExecutionRecord:
         """

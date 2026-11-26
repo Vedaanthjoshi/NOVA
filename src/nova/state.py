@@ -119,15 +119,18 @@ class NovaState(BaseModel):
     raw_symptoms: str
     status: IncidentStatus = IncidentStatus.TRIGGERED
 
-    # Workflow Run Binding (M11)
+    # Workflow Run Binding (M11 / M12)
     workflow_id: Optional[str] = None
     workflow_run_id: Optional[str] = None
+    baseline_attempts: Optional[int] = None
+    expected_output: Optional[Dict[str, Any]] = None
 
     # Investigation & Triage
     investigation_steps: int = 0
     max_investigation_steps: int = 5
     investigation_evidence: List[str] = Field(default_factory=list)
     diagnostic_history: List[DiagnosticRecord] = Field(default_factory=list)
+    reflection_history: List[Dict[str, Any]] = Field(default_factory=list)
 
     # Diagnosis & Planning
     failure_type: Optional[str] = None
@@ -164,15 +167,18 @@ class NovaGraphState(TypedDict, total=False):
     raw_symptoms: str
     status: IncidentStatus
 
-    # Workflow Run Binding (M11)
+    # Workflow Run Binding (M11 / M12)
     workflow_id: Optional[str]
     workflow_run_id: Optional[str]
+    baseline_attempts: Optional[int]
+    expected_output: Optional[Dict[str, Any]]
 
     # Investigation & Triage
     investigation_steps: int
     max_investigation_steps: int
     investigation_evidence: Annotated[List[str], operator.add]
     diagnostic_history: Annotated[List[DiagnosticRecord], operator.add]
+    reflection_history: Annotated[List[Dict[str, Any]], operator.add]
 
     # Diagnosis & Planning
     failure_type: Optional[str]

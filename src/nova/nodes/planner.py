@@ -2,11 +2,11 @@ import hashlib
 import json
 import logging
 from typing import Any, Dict, List, Optional
-from nova.environments.mock_workflow_runner import MockWorkflowRunner
 from nova.llm.client import BaseLLMClient
 from nova.llm.schemas import PlannedActionSchema
 from nova.observability import incident_context, log_event, redact_secrets, telemetry
 from nova.state import IncidentStatus, NovaGraphState, PlannedAction, RiskLevel
+from nova.tools.runner import ToolRunner
 
 logger = logging.getLogger("nova.nodes.planner")
 
@@ -96,8 +96,12 @@ def _schema_to_domain(
     )
 
 
-def create_planner_node(llm: BaseLLMClient, env: Optional[MockWorkflowRunner] = None):
-    """Factory returning a planner node bound to an LLM client and optional environment."""
+def create_planner_node(
+    llm: BaseLLMClient,
+    env: Optional[Any] = None,
+    runner: Optional[ToolRunner] = None,
+):
+    """Factory returning a planner node bound to an LLM client, environment, and tool registry."""
 
     def planner_node(state: NovaGraphState) -> Dict[str, Any]:
         incident_id = state.get("incident_id", "")
@@ -115,11 +119,52 @@ def create_planner_node(llm: BaseLLMClient, env: Optional[MockWorkflowRunner] = 
             if is_rec is None:
                 is_rec = _infer_recoverability(triage_summary, hypothesis)
 
+            bound_run_id = state.get("workflow_run_id")
             active_workflow_id = state.get("workflow_id")
             if not active_workflow_id and env is not None:
-                wf_state = env.get_state()
+                try:
+                    wf_state = (
+                        env.get_state(execution_id=bound_run_id)
+                        if bound_run_id and hasattr(env, "bind_execution")
+                        else env.get_state()
+                    )
+                except Exception:
+                    wf_state = None
                 if wf_state is not None:
-                    active_workflow_id = wf_state.workflow_id
+                    active_workflow_id = getattr(wf_state, "workflow_id", None)
+                    bound_run_id = bound_run_id or getattr(wf_state, "run_id", None)
+
+            # Build structured prior-attempt history so planner sees failed tools/postconditions
+            prior_attempts: List[Dict[str, Any]] = []
+            for rec in state.get("execution_history", []):
+                rec_dict = rec.model_dump() if hasattr(rec, "model_dump") else dict(rec)
+                prior_attempts.append(
+                    {
+                        "kind": "execution",
+                        "action_id": rec_dict.get("action_id"),
+                        "tool_name": rec_dict.get("tool_name"),
+                        "success": rec_dict.get("success"),
+                        "exit_code": rec_dict.get("exit_code"),
+                        "stderr": (rec_dict.get("stderr") or "")[:400],
+                    }
+                )
+            for vrec in state.get("verification_history", []):
+                v_dict = vrec.model_dump() if hasattr(vrec, "model_dump") else dict(vrec)
+                prior_attempts.append(
+                    {
+                        "kind": "verification",
+                        "action_id": v_dict.get("action_id"),
+                        "passed": v_dict.get("passed"),
+                        "evidence": (v_dict.get("evidence") or "")[:400],
+                        "details": v_dict.get("details") or {},
+                    }
+                )
+
+            strategy_notes = None
+            for refl in reversed(state.get("reflection_history", [])):
+                if isinstance(refl, dict) and refl.get("phase") == "outcome":
+                    strategy_notes = refl.get("alternative_strategy_notes") or refl.get("outcome_reflection")
+                    break
 
             proxy_triage = TriageResult(
                 failure_type=failure_type,
@@ -129,12 +174,18 @@ def create_planner_node(llm: BaseLLMClient, env: Optional[MockWorkflowRunner] = 
                 is_recoverable=is_rec,
                 confidence="HIGH",
                 workflow_id=active_workflow_id,
+                workflow_run_id=bound_run_id,
+                prior_attempts=prior_attempts,
+                investigation_evidence=list(state.get("investigation_evidence") or []),
+                strategy_notes=strategy_notes,
             )
+
+            available_tools = runner.describe_tools() if runner is not None else AVAILABLE_TOOLS_FOR_LLM
 
             try:
                 planner_result = llm.plan(
                     triage=proxy_triage,
-                    available_tools=AVAILABLE_TOOLS_FOR_LLM,
+                    available_tools=available_tools,
                     retry_count=retry_count,
                 )
             except Exception as exc:
@@ -167,12 +218,17 @@ def create_planner_node(llm: BaseLLMClient, env: Optional[MockWorkflowRunner] = 
                 reason = f"Incident Escalated: {planner_result.escalation_reason}"
                 telemetry.record_terminal_reason(incident_id, "ESCALATED", reason)
                 log_event(logger, logging.WARNING, "planner_escalated", reason, failure_type=failure_type)
-                return {
+                esc_out: Dict[str, Any] = {
                     "plan": [],
                     "current_action_index": 0,
                     "status": IncidentStatus.ESCALATED,
                     "final_summary": reason,
                 }
+                if planner_result.reflection is not None:
+                    esc_out["reflection_history"] = [
+                        {"phase": "planning", "retry_count": retry_count, **planner_result.reflection.model_dump()}
+                    ]
+                return esc_out
 
             # Empty non-escalating plan guard: never transition to EXECUTING with zero actions
             if not planner_result.actions:
@@ -208,11 +264,16 @@ def create_planner_node(llm: BaseLLMClient, env: Optional[MockWorkflowRunner] = 
                 retry_count=retry_count,
             )
 
-            return {
+            out_plan: Dict[str, Any] = {
                 "plan": plan,
                 "current_action_index": 0,
                 "status": IncidentStatus.EXECUTING,
             }
+            if planner_result.reflection is not None:
+                out_plan["reflection_history"] = [
+                    {"phase": "planning", "retry_count": retry_count, **planner_result.reflection.model_dump()}
+                ]
+            return out_plan
 
     return planner_node
 

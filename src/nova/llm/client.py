@@ -744,24 +744,20 @@ class GeminiLLMClient(BaseLLMClient):
     Uses JSON mode (response_mime_type='application/json') so the model
     is constrained to produce valid JSON that we parse into Pydantic models.
 
-    Prompt structure:
-      - System context: role + tool catalogue + output schema
-      - User message: the actual log / triage data to reason about
+    M12 enhancements:
+      - Dynamic tool discovery directly from `available_tools` passed by ToolRunner.
+      - Token usage tracking (`input_tokens`, `output_tokens`, `total_tokens`).
+      - Zero hardcoded workflow IDs or static tool catalogs in operational prompts.
+      - Optional structured reflection (`enable_reflection=True`) across investigation,
+        planning, and replanning (toggleable for ablation studies).
     """
 
-    AVAILABLE_TOOLS_DESCRIPTION = """
-Available tools (you MUST only reference tools from this list):
-- clear_lockfile(lock_name: str) -> DESTRUCTIVE: Removes a lockfile from the locks directory.
-- restart_service(service_name: str) -> DESTRUCTIVE: Brings an offline service back online.
-- check_service_status(service_name: str) -> READ_ONLY: Returns health status of a service.
-- read_job_logs(job_id: str, tail_lines: int) -> READ_ONLY: Returns the last N lines of a job log.
-- get_workflow_status(workflow_id: str) -> READ_ONLY: Discovers status of all jobs in the workflow.
-- inspect_job_dependencies(job_id: str) -> READ_ONLY: Inspects upstream and downstream job dependencies.
-- inspect_lockfiles(lock_name: str) -> READ_ONLY: Discovers active lockfiles on disk.
-- resume_workflow(workflow_id: str) -> LOW_RISK: Signals the batch orchestrator to retry from last checkpoint.
-"""
-
-    def __init__(self, api_key: str, model_name: str = "gemini-3.5-flash-lite"):
+    def __init__(
+        self,
+        api_key: str,
+        model_name: str = "gemini-3.5-flash-lite",
+        enable_reflection: bool = True,
+    ):
         if not api_key or not api_key.strip():
             raise ValueError(
                 "Gemini API key is required but not provided. "
@@ -778,6 +774,35 @@ Available tools (you MUST only reference tools from this list):
         genai.configure(api_key=api_key)
         self._model_name = model_name
         self._genai = genai
+        self.enable_reflection = enable_reflection
+
+    @staticmethod
+    def _format_tools(available_tools: List[Dict[str, Any]]) -> str:
+        """Formats runtime ToolRunner tool descriptors (names, params, risk, descriptions)."""
+        if not available_tools:
+            return "No tools are currently registered."
+        lines: List[str] = []
+        for tool in available_tools:
+            name = tool.get("name", "unknown")
+            risk = tool.get("risk_level", "UNKNOWN")
+            desc = tool.get("description", "")
+            params = tool.get("parameters") or {}
+            if isinstance(params, dict) and params:
+                param_str = ", ".join(f"{k}: {v}" for k, v in params.items())
+            else:
+                param_str = "(no parameters)"
+            lines.append(f"- {name} [{risk}] — {desc}\n  Parameters: {param_str}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_token_usage(response: Any) -> tuple[int, int, int]:
+        meta = getattr(response, "usage_metadata", None)
+        if meta is None:
+            return (0, 0, 0)
+        in_tok = int(getattr(meta, "prompt_token_count", 0) or 0)
+        out_tok = int(getattr(meta, "candidates_token_count", 0) or 0)
+        tot_tok = int(getattr(meta, "total_token_count", 0) or (in_tok + out_tok))
+        return (in_tok, out_tok, tot_tok)
 
     def _call(
         self,
@@ -788,13 +813,16 @@ Available tools (you MUST only reference tools from this list):
     ) -> T:
         """
         Core LLM call with JSON mode, Pydantic validation, structured telemetry,
-        and rate-limit backoff. Never logs API keys.
+        token tracking, and rate-limit backoff. Never logs API keys.
         """
         max_retries = 4
         t_total = time.perf_counter()
         retries_used = 0
         rate_limits_hit = 0
         raw_text = ""
+        in_tokens = 0
+        out_tokens = 0
+        total_tokens = 0
 
         for attempt in range(max_retries):
             try:
@@ -808,6 +836,7 @@ Available tools (you MUST only reference tools from this list):
                 )
 
                 response = model.generate_content(user_prompt)
+                in_tokens, out_tokens, total_tokens = self._extract_token_usage(response)
                 raw_text = (getattr(response, "text", None) or "").strip()
                 if not raw_text:
                     raise ValueError("Gemini API returned an empty response body.")
@@ -856,6 +885,9 @@ Available tools (you MUST only reference tools from this list):
                         rate_limits=rate_limits_hit,
                         success=False,
                         error=err_str,
+                        input_tokens=in_tokens,
+                        output_tokens=out_tokens,
+                        total_tokens=total_tokens,
                     )
                     log_event(
                         logger,
@@ -890,6 +922,9 @@ Available tools (you MUST only reference tools from this list):
                 rate_limits=rate_limits_hit,
                 success=False,
                 error=f"Invalid JSON/schema for {schema.__name__}: {safe_err}",
+                input_tokens=in_tokens,
+                output_tokens=out_tokens,
+                total_tokens=total_tokens,
             )
             raise ValueError(
                 f"LLM returned invalid JSON for schema {schema.__name__}. "
@@ -905,6 +940,9 @@ Available tools (you MUST only reference tools from this list):
             retries=retries_used,
             rate_limits=rate_limits_hit,
             success=True,
+            input_tokens=in_tokens,
+            output_tokens=out_tokens,
+            total_tokens=total_tokens,
         )
         log_event(
             logger,
@@ -915,6 +953,9 @@ Available tools (you MUST only reference tools from this list):
             model=self._model_name,
             retries=retries_used,
             rate_limits=rate_limits_hit,
+            input_tokens=in_tokens,
+            output_tokens=out_tokens,
+            total_tokens=total_tokens,
             duration_seconds=round(dt, 4),
         )
         return validated
@@ -928,15 +969,29 @@ Available tools (you MUST only reference tools from this list):
         available_tools: List[Dict[str, Any]],
         step_number: int,
     ) -> InvestigationDecision:
-        system_prompt = f"""You are an expert SRE investigator diagnosing an enterprise batch workload incident.
-Your goal is to gather sufficient empirical evidence to form a conclusive diagnosis before planning remediation.
+        tools_text = self._format_tools(available_tools)
+        reflection_schema = (
+            """,
+  "reflection": {
+    "evidence_sufficient": boolean,
+    "alternative_hypotheses": [string],
+    "remaining_uncertainty": string | null
+  }"""
+            if self.enable_reflection
+            else ""
+        )
+        reflection_rules = (
+            """
+- Before choosing DIAGNOSIS_READY, perform diagnostic reflection: verify evidence_sufficient=true against actual logs/status outputs, list plausible alternative hypotheses considered, and if genuine uncertainty remains, choose DIAGNOSTIC_ACTION to gather missing evidence."""
+            if self.enable_reflection
+            else ""
+        )
 
-Available READ-ONLY Diagnostic Tools:
-- get_workflow_status(workflow_id: str) -> Discovers execution state of all batch jobs, failed jobs, and active locks.
-- inspect_job_dependencies(job_id: str) -> Queries upstream and downstream job dependencies in the DAG.
-- read_job_logs(job_id: str, tail_lines: int) -> Reads recent log lines for a specific job.
-- check_service_status(service_name: str) -> Checks operational status and TCP port reachability of a service.
-- inspect_lockfiles(lock_name: str) -> Inspects filesystem lockfiles in the locks directory.
+        system_prompt = f"""You are an expert SRE investigator diagnosing an enterprise batch workflow incident.
+Your goal is to gather empirical evidence using ONLY the registered read-only diagnostic tools below before concluding a diagnosis or escalating.
+
+Available READ-ONLY Diagnostic Tools (discovered dynamically from registry):
+{tools_text}
 
 Output MUST be valid JSON matching EXACTLY one of these decisions:
 
@@ -947,41 +1002,42 @@ Output MUST be valid JSON matching EXACTLY one of these decisions:
     "tool_name": string,
     "parameters": {{}},
     "rationale": string
-  }}
+  }}{reflection_schema}
 }}
 
-2. Diagnosis ready (when root cause is proven by evidence):
+2. Diagnosis ready (when root cause is proven by empirical evidence):
 {{
   "decision_type": "DIAGNOSIS_READY",
   "diagnosis": {{
-    "failure_type": "STALE_LOCKFILE" | "SERVICE_OFFLINE" | "DATA_CORRUPTION" | "DEPENDENCY_FAILURE" | "UNKNOWN",
+    "failure_type": "SERVICE_OFFLINE" | "DATA_CORRUPTION" | "SOURCE_UNAVAILABLE" | "MALFORMED_INPUT" | "STALE_LOCKFILE" | "DEPENDENCY_FAILURE" | "UNKNOWN",
     "implicated_resource": string,
     "triage_summary": string,
     "root_cause_hypothesis": string,
     "is_recoverable": boolean,
     "confidence": "HIGH" | "MEDIUM" | "LOW"
-  }}
+  }}{reflection_schema}
 }}
 
-3. Escalation required (if failure is unrecoverable hardware, kernel corruption, or out of scope):
+3. Escalation required (if workflow is healthy false-positive, unrecoverable data/input/external defect, or out of scope):
 {{
   "decision_type": "ESCALATE",
-  "escalation_reason": string
+  "escalation_reason": string{reflection_schema}
 }}
 
 Rules:
-- NEVER execute destructive tools during investigation. Only READ-ONLY diagnostic tools are allowed.
-- If target service is unknown, start by calling 'get_workflow_status'.
-- If lockfiles show STATUS=ACTIVE_WORKER or recent heartbeat by a live worker, return ESCALATE (never delete active locks).
-- If workflow status shows all jobs SUCCESS and target services healthy, return ESCALATE indicating a false-positive alert with no intervention needed.
-- Tool parameters MUST come directly from gathered evidence — do not hallucinate file paths or service names.
-- Do NOT repeat identical diagnostic tool calls that already returned data.
+- NEVER invent tool names or parameters not listed in Available READ-ONLY Diagnostic Tools above.
+- Start with `get_workflow_status` if execution/task status has not yet been observed.
+- Inspect the failed task's logs (`read_job_logs`) and relevant service health (`check_service_status`) before concluding root cause.
+- If workflow status shows all tasks SUCCESS (healthy workflow, no failed tasks), return ESCALATE indicating a healthy workflow / false-positive alert with no intervention needed.
+- If lockfiles show STATUS=ACTIVE_WORKER or recent live heartbeat, return ESCALATE (never delete active locks).
+- Do NOT mark external source outages (e.g. HTTP 404/upstream release unreachable), malformed CSV/input schema errors, or checksum data corruption as recoverable unless a registered remediation tool can actually fix them.
+- Do NOT repeat identical diagnostic tool calls with identical parameters.{reflection_rules}
 """
         evidence_text = "\n".join(f"- {ev}" for ev in investigation_evidence) if investigation_evidence else "None yet."
         history_text = json.dumps(diagnostic_history, indent=2) if diagnostic_history else "No diagnostic tools run yet."
 
         user_prompt = f"""Current Investigation State (Step {step_number}):
-Target Service: {target_service or 'UNKNOWN'}
+Target Service / Task: {target_service or 'UNKNOWN'}
 Raw Symptoms: {raw_symptoms}
 
 Accumulated Evidence:
@@ -995,26 +1051,26 @@ Determine the next investigation decision as JSON."""
         return self._call(system_prompt, user_prompt, InvestigationDecision, operation="investigate")
 
     def triage(self, target_service: str, log_content: str) -> TriageResult:
-        system_prompt = f"""You are an expert SRE (Site Reliability Engineer) specializing in enterprise batch job incident diagnosis.
+        system_prompt = f"""You are an expert SRE (Site Reliability Engineer) specializing in batch job incident diagnosis.
 
 Your task: analyze a failed job's log and produce a structured diagnosis.
 
 Output MUST be valid JSON matching this exact schema:
 {{
-  "failure_type": string,         // "STALE_LOCKFILE" | "SERVICE_OFFLINE" | "DATA_CORRUPTION" | "DEPENDENCY_FAILURE" | "UNKNOWN"
-  "implicated_resource": string,  // exact resource name from the log (lock filename, service name, etc.)
-  "triage_summary": string,       // 1-2 sentence factual SRE summary
-  "root_cause_hypothesis": string,// specific technical hypothesis
-  "is_recoverable": boolean,      // true = automated tools can fix it; false = needs human
-  "confidence": string            // "HIGH" | "MEDIUM" | "LOW"
+  "failure_type": string,
+  "implicated_resource": string,
+  "triage_summary": string,
+  "root_cause_hypothesis": string,
+  "is_recoverable": boolean,
+  "confidence": "HIGH" | "MEDIUM" | "LOW"
 }}
 
 Rules:
-- implicated_resource MUST come from the log — never invent names.
-- is_recoverable = false ONLY for data corruption, missing source files, or logic errors.
+- implicated_resource MUST come from the log or observed telemetry — never invent names.
+- is_recoverable = false for data corruption, malformed input, missing upstream external files, or unfixable defects.
 - Do not add fields beyond the schema.
 """
-        user_prompt = f"""Failed service: {target_service}
+        user_prompt = f"""Failed service/task: {target_service}
 
 Log content (last 50 lines):
 {log_content}
@@ -1029,12 +1085,30 @@ Analyze and return JSON diagnosis."""
         available_tools: List[Dict[str, Any]],
         retry_count: int,
     ) -> PlannerResult:
-        active_wf_id = triage.workflow_id or "WF_NIGHTLY_BATCH_1001"
-        system_prompt = f"""You are a remediation planner for an enterprise batch pipeline.
+        tools_text = self._format_tools(available_tools)
+        reflection_schema = (
+            """,
+  "reflection": {
+    "addresses_root_cause": boolean,
+    "contradicts_prior_attempts": boolean,
+    "strategy_assessment": string
+  }"""
+            if self.enable_reflection
+            else ""
+        )
+        reflection_rules = (
+            """
+- Perform planning reflection: verify your plan directly addresses the root cause, does NOT repeat a strategy that already failed in Prior Attempts without new justification, and uses exact parameter names/values from observed evidence."""
+            if self.enable_reflection
+            else ""
+        )
 
-Given a structured incident triage, produce an ordered remediation plan.
+        system_prompt = f"""You are a remediation planner for an enterprise workflow orchestrator.
 
-{self.AVAILABLE_TOOLS_DESCRIPTION}
+Given a structured incident triage, prior attempt outcomes, and the LIVE tool registry below, produce an ordered remediation plan or escalate.
+
+Available Tools (discovered dynamically from active ToolRunner registry):
+{tools_text}
 
 Output MUST be valid JSON:
 {{
@@ -1048,29 +1122,35 @@ Output MUST be valid JSON:
       "rationale": string,
       "expected_outcome": string
     }}
-  ]
+  ]{reflection_schema}
 }}
 
 Rules:
-- If is_escalation=true, actions MUST be empty and escalation_reason MUST be set.
-- If is_escalation=false, escalation_reason MUST be null.
-- If is_escalation=false, actions MUST contain at least one action.
-- tool_name MUST exactly match one from the available tools list.
-- parameters MUST use the exact key names from the tool's signature.
-- parameter VALUES must come from the triage context — never invent them.
-- This is retry cycle {retry_count + 1}. Avoid repeating actions that already failed.
-- IMPORTANT: After any mutating action (clear_lockfile, restart_service), you MUST include
-  resume_workflow as the next action with workflow_id="{active_wf_id}".
-  The verifier is strictly read-only and will only inspect the workflow state — it does NOT
-  re-execute the pipeline. resume_workflow is required to actually run the jobs.
+- You MUST ONLY choose tools listed in Available Tools above. Never reference unregistered tools.
+- If no registered tool can resolve the diagnosed failure (e.g. external source unavailable, malformed CSV/input, data corruption, non-restartable dependency), set is_escalation=true, actions=[], and explain why in escalation_reason.
+- If is_escalation=true, actions MUST be empty and escalation_reason MUST be non-empty.
+- If is_escalation=false, escalation_reason MUST be null and actions MUST be non-empty.
+- parameters MUST use the exact parameter keys documented for each tool and values derived strictly from context (never invent IDs or names).
+- After any mutating remediation action that fixes an underlying blocker, include `resume_workflow` as the final action using the exact active execution/workflow parameter required by `resume_workflow` in Available Tools above (the verifier is strictly read-only and will not run the workflow itself).
+- Inspect Prior Attempts carefully: this is retry cycle {retry_count + 1}. Do not repeat actions/strategies that already failed.{reflection_rules}
 """
-        user_prompt = f"""Triage result:
-- workflow_id: {active_wf_id}
+        prior_json = json.dumps(triage.prior_attempts or [], indent=2)
+        evidence_text = "\n".join(f"- {ev}" for ev in (triage.investigation_evidence or [])) or "None."
+        user_prompt = f"""Triage Result:
+- workflow_id: {triage.workflow_id or 'UNKNOWN'}
+- workflow_run_id / execution_id: {triage.workflow_run_id or 'UNKNOWN'}
 - failure_type: {triage.failure_type}
 - implicated_resource: {triage.implicated_resource}
 - triage_summary: {triage.triage_summary}
 - root_cause_hypothesis: {triage.root_cause_hypothesis}
 - is_recoverable: {triage.is_recoverable}
+- replanner_strategy_notes: {triage.strategy_notes or 'None'}
+
+Investigation Evidence:
+{evidence_text}
+
+Prior Attempted Actions & Verification Outcomes:
+{prior_json}
 
 Produce the remediation plan as JSON."""
 
@@ -1089,6 +1169,20 @@ Produce the remediation plan as JSON."""
         investigation_evidence: Optional[List[str]] = None,
         original_diagnosis: Optional[Dict[str, Any]] = None,
     ) -> ReplannerResult:
+        reflection_fields = (
+            """,
+  "needs_further_investigation": boolean,
+  "outcome_reflection": string | null"""
+            if self.enable_reflection
+            else ""
+        )
+        reflection_instructions = (
+            """
+- Perform outcome reflection: explicitly explain in `outcome_reflection` why the previous action or workflow restart failed. If the current logs/evidence are insufficient or contradict the original diagnosis, set `needs_further_investigation=true` so NOVA returns to diagnostic investigation with full context."""
+            if self.enable_reflection
+            else ""
+        )
+
         system_prompt = f"""You are an expert SRE replanning agent.
 An initial remediation plan was executed, and independent post-condition verification has provided new telemetry.
 
@@ -1099,32 +1193,36 @@ Output MUST be valid JSON:
   "new_target_service": string,
   "updated_triage_summary": string,
   "updated_hypothesis": string,
-  "new_failure_type": "STALE_LOCKFILE" | "SERVICE_OFFLINE" | "DATA_CORRUPTION" | "DEPENDENCY_FAILURE" | "UNKNOWN",
+  "new_failure_type": "SERVICE_OFFLINE" | "DATA_CORRUPTION" | "SOURCE_UNAVAILABLE" | "MALFORMED_INPUT" | "STALE_LOCKFILE" | "DEPENDENCY_FAILURE" | "UNKNOWN",
   "implicated_resource": string | null,
   "is_recoverable": boolean,
   "diagnosis_revision_needed": boolean,
   "is_escalation": boolean,
   "escalation_reason": string | null,
-  "alternative_strategy_notes": string | null
+  "alternative_strategy_notes": string | null{reflection_fields}
 }}
 
 Critical Reasoning Instructions:
-- Do NOT assume the previous action succeeded. Check whether execution records show success or failure.
-- If a remediation tool (e.g. clear_lockfile, restart_service) failed or failed its postcondition, revise the hypothesis and formulate an alternative strategy (or escalate if unrecoverable).
-- If the upstream remediation tool succeeded and `resume_workflow` halted on a DIFFERENT downstream failed job, diagnose the newly surfaced downstream failure in `new_target` from its log.
-- If data corruption or an unresolvable defect is observed, set is_escalation=true, escalation_reason non-empty, and is_recoverable=false.
-- If is_escalation=false, set escalation_reason=null.
-- implicated_resource must come strictly from logs or telemetry — never invent names.
+- Do NOT assume the previous action succeeded. Check Execution Records and Verification Records carefully.
+- If a remediation tool (e.g. restart_service, clear_lockfile) failed or failed its postcondition, revise the hypothesis (`diagnosis_revision_needed=true`) and determine an alternative strategy, additional investigation, or escalation.
+- If an upstream remediation tool succeeded and `resume_workflow` halted on a DIFFERENT downstream failed task, diagnose the newly surfaced failure in `new_target` from its log.
+- If an external source is unavailable, input data is malformed/corrupt, or no registered tool can fix the newly surfaced issue, set `is_escalation=true`, `escalation_reason` non-empty, and `is_recoverable=false`.
+- If `is_escalation=false`, `escalation_reason` MUST be null.
+- `implicated_resource` must come strictly from logs or telemetry — never invent names.{reflection_instructions}
 """
         exec_json = json.dumps(execution_records or [], indent=2)
         verif_json = json.dumps(verification_records or [], indent=2)
         orig_diag_json = json.dumps(original_diagnosis or {}, indent=2)
+        inv_text = "\n".join(f"- {ev}" for ev in (investigation_evidence or [])) or "None."
 
         user_prompt = f"""Replanning Telemetry (Cycle {retry_count}):
 Original Target: {original_target}
 Action Attempted: {first_action_taken}
 Original Diagnosis:
 {orig_diag_json}
+
+Prior Investigation Evidence:
+{inv_text}
 
 Execution Records:
 {exec_json}

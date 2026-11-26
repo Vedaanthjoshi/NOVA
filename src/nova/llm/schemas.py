@@ -26,6 +26,22 @@ class DiagnosticToolCall(BaseModel):
     rationale: str = Field(description="Why this diagnostic tool is needed to gather evidence")
 
 
+class DiagnosticReflection(BaseModel):
+    """Lightweight diagnostic self-critique evaluating evidence sufficiency and alternatives."""
+    evidence_sufficient: bool = Field(
+        default=True,
+        description="True only if gathered observations conclusively support the diagnosis without guessing."
+    )
+    alternative_hypotheses: List[str] = Field(
+        default_factory=list,
+        description="Plausible alternative causes considered and ruled out (or still open)."
+    )
+    remaining_uncertainty: Optional[str] = Field(
+        default=None,
+        description="Any remaining ambiguity or unverified assumption in the evidence."
+    )
+
+
 class InvestigationDecision(BaseModel):
     """
     Structured output from an investigation step.
@@ -44,6 +60,10 @@ class InvestigationDecision(BaseModel):
     escalation_reason: Optional[str] = Field(
         default=None,
         description="Required if decision_type is ESCALATE"
+    )
+    reflection: Optional[DiagnosticReflection] = Field(
+        default=None,
+        description="Optional diagnostic reflection assessing evidence sufficiency and alternative explanations."
     )
 
     @model_validator(mode="after")
@@ -106,6 +126,22 @@ class TriageResult(BaseModel):
         default=None,
         description="Active workflow ID associated with the diagnosed incident, if known."
     )
+    workflow_run_id: Optional[str] = Field(
+        default=None,
+        description="Active workflow run or execution ID bound to this incident, if known."
+    )
+    prior_attempts: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Structured history of prior attempted actions, execution outcomes, and verification failures."
+    )
+    investigation_evidence: List[str] = Field(
+        default_factory=list,
+        description="Diagnostic observations gathered during investigation."
+    )
+    strategy_notes: Optional[str] = Field(
+        default=None,
+        description="Notes from replanning explaining why previous remediation failed or what changed."
+    )
 
 
 class PlannedActionSchema(BaseModel):
@@ -141,6 +177,22 @@ class PlannedActionSchema(BaseModel):
     )
 
 
+class PlanningReflection(BaseModel):
+    """Lightweight planning self-critique verifying alignment with root cause and prior outcomes."""
+    addresses_root_cause: bool = Field(
+        default=True,
+        description="Whether the proposed actions directly resolve the verified root cause."
+    )
+    contradicts_prior_attempts: bool = Field(
+        default=False,
+        description="True if this plan repeats a strategy that already failed without new justification."
+    )
+    strategy_assessment: str = Field(
+        default="",
+        description="Brief check confirming parameters match observed evidence and preconditions."
+    )
+
+
 class PlannerResult(BaseModel):
     """
     Structured output from the Planner LLM call.
@@ -167,10 +219,12 @@ class PlannerResult(BaseModel):
         description=(
             "Ordered list of actions to execute. Must be empty if is_escalation=True. "
             "Must be non-empty if is_escalation=False. "
-            "Actions are executed in order; each depends on the previous succeeding. "
-            "IMPORTANT: Include resume_workflow as the final action after any mutating fix "
-            "(clear_lockfile, restart_service) so the workflow actually re-executes before verification."
+            "Actions are executed in order; each depends on the previous succeeding."
         )
+    )
+    reflection: Optional[PlanningReflection] = Field(
+        default=None,
+        description="Optional planning reflection checking strategy alignment against prior attempts."
     )
 
     @model_validator(mode="after")
@@ -257,6 +311,14 @@ class ReplannerResult(BaseModel):
     alternative_strategy_notes: Optional[str] = Field(
         default=None,
         description="Detailed notes explaining why previous plan failed and what alternative strategy is chosen."
+    )
+    needs_further_investigation: bool = Field(
+        default=False,
+        description="True if existing evidence is insufficient or contradicted and triage must gather more diagnostics."
+    )
+    outcome_reflection: Optional[str] = Field(
+        default=None,
+        description="Reflection on why the prior attempt failed or surfaced a new failure and whether diagnosis must change."
     )
 
     @model_validator(mode="after")

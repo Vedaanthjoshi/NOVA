@@ -3,7 +3,6 @@ import re
 import time
 from typing import Any, Dict, Optional
 
-from nova.environments.mock_workflow_runner import MockWorkflowRunner
 from nova.llm.client import BaseLLMClient
 from nova.llm.schemas import (
     DiagnosticToolCall,
@@ -24,7 +23,7 @@ logger = logging.getLogger("nova.nodes.triage")
 
 
 def create_triage_node(
-    env: MockWorkflowRunner,
+    env: Any,
     llm: BaseLLMClient,
     tool_runner: Optional[ToolRunner] = None,
 ):
@@ -66,14 +65,21 @@ def create_triage_node(
         step_number = state.get("investigation_steps", 0) + 1
         max_steps = state.get("max_investigation_steps", 5)
 
-        # M11: Capture active workflow_id / workflow_run_id on first investigation step if unbound
+        # M11/M12: Capture active workflow_id / workflow_run_id & baseline attempt count if unbound
         bound_wf_id = state.get("workflow_id")
         bound_run_id = state.get("workflow_run_id")
-        if not bound_run_id:
-            wf_state = env.get_state()
+        baseline_attempts = state.get("baseline_attempts")
+        wf_state = None
+        if not bound_run_id or baseline_attempts is None:
+            try:
+                wf_state = env.get_state(execution_id=bound_run_id) if bound_run_id and hasattr(env, "bind_execution") else env.get_state()
+            except Exception:
+                wf_state = None
             if wf_state is not None:
-                bound_wf_id = bound_wf_id or wf_state.workflow_id
-                bound_run_id = wf_state.run_id
+                bound_wf_id = bound_wf_id or getattr(wf_state, "workflow_id", None)
+                bound_run_id = bound_run_id or getattr(wf_state, "run_id", None)
+                if baseline_attempts is None and hasattr(wf_state, "total_attempts"):
+                    baseline_attempts = getattr(wf_state, "total_attempts")
 
         # Budget Check: Bounded investigation loop
         if step_number > max_steps:
@@ -88,12 +94,8 @@ def create_triage_node(
                 "final_summary": reason,
             }
 
-        # Available read-only tools
-        diagnostic_tools = [
-            {"name": name, "description": tool.description, "risk_level": tool.risk_level.value}
-            for name, tool in runner._registry.items()
-            if tool.risk_level == RiskLevel.READ_ONLY
-        ]
+        # Dynamic read-only tool discovery directly from active ToolRunner registry
+        diagnostic_tools = runner.describe_tools(risk_filter=RiskLevel.READ_ONLY)
 
         # Call LLM to investigate
         try:
@@ -232,8 +234,7 @@ def create_triage_node(
                 rationale=diag_call.rationale,
             )
             evidence_line = f"Step {step_number} [{tool_name}]: {tool_output}"
-
-            return {
+            out_dict: Dict[str, Any] = {
                 "diagnostic_history": [rec],
                 "investigation_evidence": [evidence_line],
                 "investigation_steps": step_number,
@@ -241,27 +242,36 @@ def create_triage_node(
                 "workflow_run_id": bound_run_id,
                 "status": IncidentStatus.TRIAGING,
             }
+            if baseline_attempts is not None:
+                out_dict["baseline_attempts"] = baseline_attempts
+            if decision.reflection is not None:
+                out_dict["reflection_history"] = [
+                    {
+                        "phase": "diagnostic",
+                        "step": step_number,
+                        **decision.reflection.model_dump(),
+                    }
+                ]
+            return out_dict
 
         # Case 2: DIAGNOSIS_READY
         elif decision.decision_type == InvestigationActionType.DIAGNOSIS_READY:
             diag = decision.diagnosis
             new_target = target_service
             if not new_target or new_target == "UNKNOWN":
-                if diag.implicated_resource and diag.implicated_resource.startswith("JOB_"):
+                # Check diagnostic history (e.g. job_id from read_job_logs)
+                for rec in reversed(diagnostic_history):
+                    rec_tool = rec.tool_name if hasattr(rec, "tool_name") else rec.get("tool_name")
+                    rec_params = rec.parameters if hasattr(rec, "parameters") else rec.get("parameters", {})
+                    if rec_tool == "read_job_logs" and rec_params.get("job_id"):
+                        new_target = rec_params.get("job_id")
+                        break
+                if (not new_target or new_target == "UNKNOWN") and diag.implicated_resource:
                     new_target = diag.implicated_resource
-                else:
-                    # Extract target job from diagnostic history (e.g. job_id from read_job_logs)
-                    for rec in reversed(diagnostic_history):
-                        rec_tool = rec.tool_name if hasattr(rec, "tool_name") else rec.get("tool_name")
-                        rec_params = rec.parameters if hasattr(rec, "parameters") else rec.get("parameters", {})
-                        if rec_tool == "read_job_logs" and rec_params.get("job_id"):
-                            new_target = rec_params.get("job_id")
-                            break
-                    # Fallback: inspect triage summary or hypothesis
-                    if not new_target or new_target == "UNKNOWN":
-                        job_m = re.search(r"(JOB_0[1-4]_[A-Z]+)", f"{diag.triage_summary} {diag.root_cause_hypothesis}")
-                        if job_m:
-                            new_target = job_m.group(1)
+                if not new_target or new_target == "UNKNOWN":
+                    job_m = re.search(r"(JOB_0[1-4]_[A-Z]+)", f"{diag.triage_summary} {diag.root_cause_hypothesis}")
+                    if job_m:
+                        new_target = job_m.group(1)
 
             log_event(
                 logger,
@@ -272,7 +282,7 @@ def create_triage_node(
                 implicated_resource=diag.implicated_resource,
                 is_recoverable=diag.is_recoverable,
             )
-            return {
+            out_ready: Dict[str, Any] = {
                 "failure_type": diag.failure_type,
                 "implicated_resource": diag.implicated_resource,
                 "is_recoverable": diag.is_recoverable,
@@ -283,6 +293,17 @@ def create_triage_node(
                 "workflow_run_id": bound_run_id,
                 "status": IncidentStatus.PLANNING,
             }
+            if baseline_attempts is not None:
+                out_ready["baseline_attempts"] = baseline_attempts
+            if decision.reflection is not None:
+                out_ready["reflection_history"] = [
+                    {
+                        "phase": "diagnostic",
+                        "step": step_number,
+                        **decision.reflection.model_dump(),
+                    }
+                ]
+            return out_ready
 
         # Case 3: ESCALATE
         elif decision.decision_type == InvestigationActionType.ESCALATE:

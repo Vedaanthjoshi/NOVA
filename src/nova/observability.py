@@ -164,6 +164,9 @@ class IncidentTelemetry:
     llm_rate_limit_count: int = 0
     llm_error_count: int = 0
     llm_duration_seconds: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
     diagnostic_tool_count: int = 0
     remediation_tool_count: int = 0
     tool_failure_count: int = 0
@@ -183,6 +186,9 @@ class IncidentTelemetry:
             "llm_rate_limit_count": self.llm_rate_limit_count,
             "llm_error_count": self.llm_error_count,
             "llm_duration_seconds": round(self.llm_duration_seconds, 4),
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
             "diagnostic_tool_count": self.diagnostic_tool_count,
             "remediation_tool_count": self.remediation_tool_count,
             "tool_failure_count": self.tool_failure_count,
@@ -228,6 +234,9 @@ class TelemetryRegistry:
                 llm_rate_limit_count=int(data.get("llm_rate_limit_count", 0)),
                 llm_error_count=int(data.get("llm_error_count", 0)),
                 llm_duration_seconds=float(data.get("llm_duration_seconds", 0.0)),
+                input_tokens=int(data.get("input_tokens", 0)),
+                output_tokens=int(data.get("output_tokens", 0)),
+                total_tokens=int(data.get("total_tokens", 0)),
                 diagnostic_tool_count=int(data.get("diagnostic_tool_count", 0)),
                 remediation_tool_count=int(data.get("remediation_tool_count", 0)),
                 tool_failure_count=int(data.get("tool_failure_count", 0)),
@@ -249,6 +258,9 @@ class TelemetryRegistry:
         rate_limits: int = 0,
         success: bool = True,
         error: Optional[str] = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        total_tokens: int = 0,
     ) -> None:
         key = incident_id or get_current_incident_id() or "_global"
         with self._lock:
@@ -256,6 +268,9 @@ class TelemetryRegistry:
             m.llm_request_count += 1
             m.llm_retry_count += retries
             m.llm_rate_limit_count += rate_limits
+            m.input_tokens += max(0, input_tokens)
+            m.output_tokens += max(0, output_tokens)
+            m.total_tokens += max(0, total_tokens or (input_tokens + output_tokens))
             if not success:
                 m.llm_error_count += 1
                 if error:
@@ -269,6 +284,9 @@ class TelemetryRegistry:
                     "duration_seconds": round(duration_seconds, 4),
                     "retries": retries,
                     "rate_limits": rate_limits,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": total_tokens or (input_tokens + output_tokens),
                     "success": success,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }

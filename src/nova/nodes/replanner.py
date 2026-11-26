@@ -9,7 +9,7 @@ from nova.state import IncidentStatus, NovaGraphState
 logger = logging.getLogger("nova.nodes.replanner")
 
 
-def create_replanner_node(env: MockWorkflowRunner, llm: BaseLLMClient):
+def create_replanner_node(env: Any, llm: BaseLLMClient):
     """Factory returning a replanning node bound to the environment and LLM client."""
 
     def replanner_node(state: NovaGraphState) -> Dict[str, Any]:
@@ -77,16 +77,21 @@ def create_replanner_node(env: MockWorkflowRunner, llm: BaseLLMClient):
             else:
                 first_action_taken = last_exec.tool_name
 
-        # Extract the new failing job from verification evidence
+        # Extract the new failing job/task ID from verification evidence
+        # Supports both uppercase JOB_03_LOAD and lowercase Kestra task IDs (e.g. green_copy_in_to_staging_table)
         new_target = original_target
         if failed_jobs:
             first_failed = failed_jobs[0]
-            match = re.match(r"^([A-Z0-9_]+)", first_failed)
+            match = re.match(r"^([A-Za-z0-9_.-]+)", first_failed)
             if match:
                 new_target = match.group(1)
 
-        # Read diagnostic log for the new target from disk
-        new_diagnostic_log = env.read_job_log(new_target)
+        # Read diagnostic log for the new target
+        bound_run_id = state.get("workflow_run_id")
+        if bound_run_id and hasattr(env, "bind_execution"):
+            new_diagnostic_log = env.read_job_log(new_target, execution_id=bound_run_id)
+        else:
+            new_diagnostic_log = env.read_job_log(new_target)
         if not new_diagnostic_log.strip():
             new_diagnostic_log = f"No log content found for {new_target}"
 
@@ -136,20 +141,29 @@ def create_replanner_node(env: MockWorkflowRunner, llm: BaseLLMClient):
                 "current_action_index": 0,
             }
 
+        # Check for further investigation routing (Phase 3D + Outcome Reflection)
+        can_reinvestigate = (
+            replan_result.needs_further_investigation
+            and state.get("investigation_steps", 0) < state.get("max_investigation_steps", 5)
+        )
+        next_status = IncidentStatus.TRIAGING if can_reinvestigate else IncidentStatus.REPLANNING
+
         log_event(
             logger,
             logging.INFO,
             "replan_formulated",
-            f"Replanning cycle {new_retry_count}: target={replan_result.new_target_service}, failure={replan_result.new_failure_type}",
+            f"Replanning cycle {new_retry_count}: target={replan_result.new_target_service}, "
+            f"failure={replan_result.new_failure_type}, reinvestigate={can_reinvestigate}",
             retry_count=new_retry_count,
             new_target=replan_result.new_target_service,
             new_failure_type=replan_result.new_failure_type,
+            reinvestigate=can_reinvestigate,
         )
 
         # --- Step 3: Map validated output into graph state ---
-        return {
+        out_state: Dict[str, Any] = {
             "retry_count": new_retry_count,
-            "status": IncidentStatus.REPLANNING,
+            "status": next_status,
             "target_service": replan_result.new_target_service,
             "failure_type": replan_result.new_failure_type,
             "implicated_resource": replan_result.implicated_resource,
@@ -159,5 +173,20 @@ def create_replanner_node(env: MockWorkflowRunner, llm: BaseLLMClient):
             "plan": [],
             "current_action_index": 0,
         }
+        if replan_result.outcome_reflection or replan_result.alternative_strategy_notes:
+            out_state["reflection_history"] = [
+                {
+                    "phase": "outcome",
+                    "retry_count": new_retry_count,
+                    "needs_further_investigation": can_reinvestigate,
+                    "outcome_reflection": replan_result.outcome_reflection,
+                    "alternative_strategy_notes": replan_result.alternative_strategy_notes,
+                }
+            ]
+            if replan_result.outcome_reflection:
+                out_state["investigation_evidence"] = [
+                    f"[Outcome Reflection cycle {new_retry_count}] {replan_result.outcome_reflection}"
+                ]
+        return out_state
 
     return replanner_node

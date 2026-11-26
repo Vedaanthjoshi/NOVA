@@ -39,6 +39,7 @@ flowchart TD
     
     %% Replanning Loop
     Replanner -- "Re-diagnosis Ready (status == REPLANNING)" --> Planner
+    Replanner -- "Further Investigation Needed (status == TRIAGING)" --> Triage
     Replanner -- "Replanner Escalation" --> EndNode
 ```
 
@@ -72,17 +73,18 @@ flowchart TD
 ### Node 4: Post-Condition Verification (`src/nova/nodes/verifier.py`)
 - **Type**: Strictly Read-Only Post-Condition Verifier.
 - **Function**:
-  - Reads `env.get_state()` only — never mutates the environment or calls `env.run_workflow()`.
-  - Verifies that at least one non-read-only remediation or `resume_workflow` action executed, validates `workflow_run_id` binding, and confirms all jobs completed with `JobStatus.SUCCESS`.
-  - Injects `VerificationRecord` into the audit trail with failed jobs telemetry.
+  - Reads `env.get_state(...)` only — never mutates the environment or invokes workflow execution directly.
+  - Verifies that at least one non-read-only remediation or `resume_workflow` action executed, validates `workflow_run_id` binding, checks `observed_attempts > baseline_attempts` so stale prior task successes are never credited, and confirms all tasks completed with `JobStatus.SUCCESS`.
+  - When `expected_output` is configured in Kestra scenarios, executes `KestraEnvironment.verify_output()` via read-only PostgreSQL SQL queries (`row_count`, `distinct_ids`, `sum_total_amount`).
+  - Injects `VerificationRecord` into the audit trail with failed task telemetry.
 
 ### Node 5: Evidence-Based Replanner (`src/nova/nodes/replanner.py`)
-- **Type**: LLM Re-Diagnosis with Ground-Truth Telemetry.
+- **Type**: LLM Re-Diagnosis with Ground-Truth Telemetry & Adaptive Re-Investigation.
 - **Function**:
-  - Evaluates actual execution records and verification records without assuming previous remediation succeeded.
-  - Revises incorrect hypotheses if an action failed execution or postcondition checks.
-  - Diagnoses newly surfaced downstream dependencies when upstream remediation succeeded and `resume_workflow` exposed a downstream job failure.
-  - Escalates immediately if unrecoverable data corruption is detected.
+  - Evaluates actual execution records, failed postconditions, failed task identifiers, and verification records without assuming previous remediation succeeded.
+  - Preserves attempted strategies (`prior_attempts`) and evidence so `planner` avoids repeating failed fixes.
+  - Supports `needs_further_investigation=True` routing (`replanner -> triage`) within existing investigation/retry budgets when new downstream failures require fresh log/service evidence.
+  - Records bounded `outcome` reflection telemetry (`enable_reflection=True`) and escalates immediately on unrecoverable data corruption.
 
 ---
 
@@ -242,3 +244,23 @@ flowchart TD
    - `scripts/demonstrate_milestone9.py` (5/5 phases verified end-to-end with real Gemini).
 9. **Known Limitations**: Current UI uses HTTP polling (`3s` auto-refresh or manual poll) rather than WebSocket/SSE streaming; operator RBAC is self-asserted for local simulated operation only.
 10. **Technical Interview Defense**: *"Why did you separate the Streamlit dashboard from the LangGraph agent via FastAPI rather than calling LangGraph directly from Streamlit?"* -> *"Streamlit's reactive execution model re-executes the Python script from top to bottom on every user interaction. If Streamlit directly managed LangGraph execution, long-running agent loops would block the UI thread, user clicks would restart runs or orphan background threads, and SQLite checkpointers would suffer write-lock contention. Decoupling presentation from orchestration via a FastAPI REST gateway with background thread management ensures non-blocking operational reliability, proper connection lifecycle handling, and enables remote integration with enterprise event buses."*
+
+---
+
+### Deep Dive 6: Real Kestra & PostgreSQL Integration (`KestraEnvironment`, Milestone 12)
+
+1. **Deployment Topology** (`deploy/kestra/`):
+   - Custom slim image `nova-kestra-slim:v1.3.49` built from `kestra/kestra:v1.3.49-slim` installing `wget`, `plugin-script-shell:1.3.1`, and `plugin-jdbc-postgres:1.3.3`.
+   - Three containers: `nova_kestra` (`127.0.0.1:8080-8081`, 1792 MiB limit), `nova_kestra_postgres` (`postgres:16-alpine`, 512 MiB limit), and `nova_taxi_pgdatabase` (`postgres:16-alpine`, `ny_taxi`, `127.0.0.1:5432`, 512 MiB limit). `pgAdmin` omitted to conserve host RAM (12 GB laptop).
+2. **Environment Adapter & Tool Set** (`src/nova/environments/kestra_runner.py`, `src/nova/tools/kestra_tools.py`):
+   - Reuses NOVA's tool contracts (`get_workflow_status`, `read_job_logs`, `inspect_job_dependencies`, `check_service_status`, `resume_workflow`, and `restart_service` restricted to designated dependency `pgdatabase`).
+   - Excludes mock-only `inspect_lockfiles` and `clear_lockfile` tools via `create_kestra_tool_runner(env)`.
+   - Binds incidents to real Kestra execution IDs, preserves arbitrary task IDs (`green_create_table`, `load_staging_csv`, etc.), and restarts failed executions via `POST /api/v1/main/executions/{id}/restart` with bounded status polling and fresh-attempt verification (`total_attempts > baseline_attempts`).
+
+---
+
+### Deep Dive 7: Dynamic Tool Discovery, Leakage Removal & Bounded Reflection
+
+1. **Root Cause Leakage Removal**: `GetWorkflowStatusTool` (`src/nova/tools/workflow_tools.py`) no longer emits hidden `Scenario:` labels; diagnosis relies exclusively on real task states, error messages, and logs.
+2. **Dynamic Tool Discovery**: `ToolRunner.describe_tools()` (`src/nova/tools/runner.py`) introspects registered `BaseTool` instances and Pydantic `args_schema.model_json_schema()` at runtime, supplying both investigation (`READ_ONLY`) and planning prompts dynamically without hardcoded tool tables or default workflow IDs.
+3. **Bounded Reflection & Ablation**: `GeminiLLMClient(..., enable_reflection=True)` requests concise diagnostic, planning, and outcome reflection fields within existing `Investigate`, `Plan`, and `Replan` schema calls (no extra nodes), persisted into `NovaGraphState.reflection_history`. In live `n=5` evaluation on `gemini-3.5-flash-lite`, reflection resolved an unseen cascading Docker DNS/DB-stop + upstream gzip EOF fault where reflection-disabled NOVA anchored on `UnknownHostException` and escalated prematurely.

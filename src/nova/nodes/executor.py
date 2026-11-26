@@ -6,7 +6,6 @@ from typing import Any, Dict, Optional
 from langgraph.types import interrupt
 from nova.environments.mock_workflow_runner import (
     JobStatus,
-    MockWorkflowRunner,
     resolve_contained_path,
 )
 from nova.observability import incident_context, log_event, telemetry
@@ -22,20 +21,28 @@ from nova.tools.runner import ToolRunner
 logger = logging.getLogger("nova.nodes.executor")
 
 
-def _resolve_env(runner: ToolRunner, env: Optional[MockWorkflowRunner]) -> Optional[MockWorkflowRunner]:
-    """Extracts MockWorkflowRunner from injected argument or registered tools."""
+def _resolve_env(runner: ToolRunner, env: Optional[Any]) -> Optional[Any]:
+    """Extracts environment instance from injected argument or registered tools."""
     if env is not None:
         return env
     for tool in runner._registry.values():
         tool_env = getattr(tool, "env", None)
-        if isinstance(tool_env, MockWorkflowRunner):
+        if tool_env is not None and hasattr(tool_env, "get_state"):
             return tool_env
     return None
 
 
-def _check_run_binding(state: NovaGraphState, env: Optional[MockWorkflowRunner]) -> Optional[str]:
+def _get_env_state(env: Any, run_id: Optional[str]) -> Any:
+    if env is None:
+        return None
+    if run_id and hasattr(env, "bind_execution"):
+        return env.get_state(execution_id=run_id)
+    return env.get_state()
+
+
+def _check_run_binding(state: NovaGraphState, env: Optional[Any]) -> Optional[str]:
     """
-    Validates that the current workflow state on disk still matches the workflow_id
+    Validates that the current workflow state still matches the workflow_id
     and workflow_run_id captured when this incident started.
     Returns None if valid or unbound; returns an error message if mismatched.
     """
@@ -43,7 +50,7 @@ def _check_run_binding(state: NovaGraphState, env: Optional[MockWorkflowRunner])
     bound_wf_id = state.get("workflow_id")
     if not bound_run_id or env is None:
         return None
-    current_wf = env.get_state()
+    current_wf = _get_env_state(env, bound_run_id)
     if current_wf is None:
         return (
             f"Workflow run binding violation: expected run '{bound_run_id}' "
@@ -59,7 +66,10 @@ def _check_run_binding(state: NovaGraphState, env: Optional[MockWorkflowRunner])
 
 
 def _check_postcondition(
-    tool_name: str, parameters: Dict[str, Any], env: Optional[MockWorkflowRunner]
+    tool_name: str,
+    parameters: Dict[str, Any],
+    env: Optional[Any],
+    bound_run_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Deterministic post-condition check for mutating actions.
@@ -72,12 +82,12 @@ def _check_postcondition(
     if env is None:
         return None
 
-    if tool_name == "clear_lockfile":
+    if tool_name == "clear_lockfile" and hasattr(env, "locks_dir"):
         lock_name = parameters.get("lock_name", "")
         if not lock_name:
             return None
         state = env.get_state()
-        if state and lock_name in state.active_locks:
+        if state and lock_name in getattr(state, "active_locks", []):
             return f"Postcondition failed: '{lock_name}' is still listed in active_locks after clear_lockfile."
         safe_lock = resolve_contained_path(env.locks_dir, lock_name)
         if safe_lock is None:
@@ -102,12 +112,13 @@ def _check_postcondition(
         return None
 
     if tool_name == "resume_workflow":
-        state = env.get_state()
+        target_eid = parameters.get("execution_id") or bound_run_id
+        state = _get_env_state(env, target_eid)
         if state is None:
             return "Postcondition failed: workflow state absent after resume_workflow."
         failed = [j.id for j in state.jobs.values() if j.status != JobStatus.SUCCESS]
         if failed:
-            return f"Postcondition failed: jobs not in SUCCESS state after resume_workflow: {failed}"
+            return f"Postcondition failed: tasks/jobs not in SUCCESS state after resume_workflow: {failed}"
         return None
 
     return None
@@ -115,7 +126,7 @@ def _check_postcondition(
 
 def create_executor_node(
     runner: ToolRunner,
-    env: Optional[MockWorkflowRunner] = None,
+    env: Optional[Any] = None,
     require_approval: bool = True,
 ):
     """Factory returning an executor node bound to a ToolRunner, environment, and HITL safety policy."""
@@ -432,7 +443,12 @@ def create_executor_node(
             }
 
         # M11: Deterministic postcondition check for mutating actions.
-        postcondition_error = _check_postcondition(action.tool_name, action.parameters, resolved_env)
+        postcondition_error = _check_postcondition(
+            action.tool_name,
+            action.parameters,
+            resolved_env,
+            bound_run_id=state.get("workflow_run_id"),
+        )
         if postcondition_error:
             reason = (
                 f"Execution postcondition failed for '{action.action_id}' ({action.tool_name}): "

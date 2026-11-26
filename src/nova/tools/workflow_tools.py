@@ -323,7 +323,6 @@ class GetWorkflowStatusTool(BaseTool):
         summary_lines = [
             f"Workflow ID: {state.workflow_id} ({state.name})",
             f"Run ID: {state.run_id}",
-            f"Scenario: {state.scenario.value}",
             "Job States:",
         ]
         failed_jobs = []
@@ -348,7 +347,6 @@ class GetWorkflowStatusTool(BaseTool):
             data={
                 "workflow_id": state.workflow_id,
                 "run_id": state.run_id,
-                "scenario": state.scenario.value,
                 "failed_jobs": failed_jobs,
                 "active_locks": active_locks,
                 "services": services,

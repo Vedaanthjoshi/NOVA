@@ -809,10 +809,25 @@ def test_gemini_client_plan_and_replan_prompts_and_schema_guard(monkeypatch):
         is_recoverable=True,
         workflow_id="WF_CUSTOM_2026",
     )
-    plan_res = client.plan(triage, [], retry_count=0)
+    sample_tools = [
+        {
+            "name": "clear_lockfile",
+            "description": "Removes lockfile",
+            "parameters": {"lock_name": "str (required)"},
+            "risk_level": "DESTRUCTIVE",
+        },
+        {
+            "name": "resume_workflow",
+            "description": "Resumes workflow",
+            "parameters": {"workflow_id": "str (required)"},
+            "risk_level": "LOW_RISK",
+        },
+    ]
+    plan_res = client.plan(triage, sample_tools, retry_count=0)
     assert len(plan_res.actions) == 2
     assert plan_res.actions[1].tool_name == "resume_workflow"
-    assert "WF_CUSTOM_2026" in captured_prompts[0]["system"]
+    assert "WF_CUSTOM_2026" in captured_prompts[0]["user"]
+    assert "clear_lockfile" in captured_prompts[0]["system"]
     assert "resume_workflow" in captured_prompts[0]["system"]
 
     replan_res = client.replan(

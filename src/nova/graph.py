@@ -1,8 +1,9 @@
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
+from nova.environments.kestra_runner import KestraEnvironment
 from nova.environments.mock_workflow_runner import MockWorkflowRunner
 from nova.llm.client import BaseLLMClient, MockLLMClient
 from nova.nodes.executor import create_executor_node
@@ -11,6 +12,7 @@ from nova.nodes.replanner import create_replanner_node
 from nova.nodes.triage import create_triage_node
 from nova.nodes.verifier import create_verifier_node
 from nova.state import IncidentStatus, NovaGraphState
+from nova.tools.kestra_tools import create_kestra_tool_runner
 from nova.tools.runner import ToolRunner, create_default_tool_runner
 
 
@@ -77,21 +79,24 @@ def route_after_verifier(state: NovaGraphState) -> Literal["replanner", "__end__
     return "replanner"
 
 
-def route_after_replanner(state: NovaGraphState) -> Literal["planner", "__end__"]:
+def route_after_replanner(state: NovaGraphState) -> Literal["triage", "planner", "__end__"]:
     """
     Conditional routing after replanning:
-    - ESCALATED: Replanner determined incident is unrecoverable → go to END.
-    - Otherwise → go to planner to formulate the updated remediation plan.
+    - ESCALATED / FAILED: Replanner determined incident is unrecoverable -> go to END.
+    - TRIAGING: Replanner requested additional diagnostic investigation -> loop back to triage.
+    - Otherwise -> go to planner to formulate the updated remediation plan.
     """
     status = state.get("status")
     if status in (IncidentStatus.ESCALATED, IncidentStatus.FAILED):
         return "__end__"
+    if status == IncidentStatus.TRIAGING:
+        return "triage"
     return "planner"
 
 
 
 def build_nova_graph(
-    env: MockWorkflowRunner,
+    env: Any,
     tool_runner: Optional[ToolRunner] = None,
     checkpointer: Optional[BaseCheckpointSaver] = None,
     require_approval: Optional[bool] = None,
@@ -101,8 +106,8 @@ def build_nova_graph(
     Constructs and compiles the core LangGraph state machine.
 
     Parameters:
-        env: The MockWorkflowRunner providing the simulated enterprise environment.
-        tool_runner: Optional custom ToolRunner. Defaults to the standard registry.
+        env: MockWorkflowRunner or KestraEnvironment providing the execution environment.
+        tool_runner: Optional custom ToolRunner. Defaults to Kestra or Mock registry based on env.
         checkpointer: Optional BaseCheckpointSaver for HITL state persistence.
                       When provided, HITL approval defaults to True.
         require_approval: Override for HITL policy. None = auto-detect from checkpointer.
@@ -110,10 +115,15 @@ def build_nova_graph(
              Defaults to MockLLMClient for safety (never accidentally calls real API).
 
     Graph topology:
-        START → triage → planner → [executor → verifier → replanner ↩] → END
+        START → triage → planner → [executor → verifier → replanner ↩ (to planner or triage)] → END
                                  ↘ END (escalation / no plan)
     """
-    runner = tool_runner or create_default_tool_runner(env)
+    if tool_runner is not None:
+        runner = tool_runner
+    elif isinstance(env, KestraEnvironment):
+        runner = create_kestra_tool_runner(env)
+    else:
+        runner = create_default_tool_runner(env)
     approval_policy = (checkpointer is not None) if require_approval is None else require_approval
 
     # Default to mock LLM if none provided — prevents accidental API calls in tests
@@ -123,7 +133,7 @@ def build_nova_graph(
 
     # Add all nodes — each factory injects its dependencies
     graph_builder.add_node("triage", create_triage_node(env, llm_client, tool_runner=runner))
-    graph_builder.add_node("planner", create_planner_node(llm_client, env=env))
+    graph_builder.add_node("planner", create_planner_node(llm_client, env=env, runner=runner))
     graph_builder.add_node("executor", create_executor_node(runner, env=env, require_approval=approval_policy))
     graph_builder.add_node("verifier", create_verifier_node(env, tool_runner=runner))
     graph_builder.add_node("replanner", create_replanner_node(env, llm_client))
@@ -158,7 +168,7 @@ def build_nova_graph(
     graph_builder.add_conditional_edges(
         "replanner",
         route_after_replanner,
-        {"planner": "planner", "__end__": END},
+        {"triage": "triage", "planner": "planner", "__end__": END},
     )
 
     return graph_builder.compile(checkpointer=checkpointer)

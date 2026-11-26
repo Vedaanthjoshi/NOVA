@@ -1,8 +1,8 @@
 # Project Progress Tracker: NOVA
 
 **Current Date**: 2026-11-26  
-**Current Phase**: Milestone 11 — Execution & Safety Correctness (Completed)  
-**Current Milestone**: Milestone 11 — Execution & Safety Correctness (Reduced Prototype Scope)
+**Current Phase**: Milestone 12 — Real Workflow Integration & Agentic Intelligence (Completed)  
+**Current Milestone**: Milestone 12 — Kestra/PostgreSQL Integration, Dynamic Discovery, Reflection & Live Evaluation
 
 ---
 
@@ -195,13 +195,24 @@
   - **Verification**: `python -m pytest -q` -> **134 passed** (including 14 new regression tests in `tests/integration/test_milestone11_correctness.py`).
   - **Deferred Limitations**: Enterprise caller auth (JWT/OAuth), automatic restart recovery of interrupted/in-flight approvals, distributed multi-worker locking, advanced approval command-table persistence, and replacing `SqliteSaver` pickle serialization remain deferred for prototype scope.
 
+- [x] **Milestone 12: Real Workflow Integration & Agentic Intelligence**:
+  - **Phase 1 — Slim Kestra & PostgreSQL Deployment** (`deploy/kestra/Dockerfile`, `deploy/kestra/docker-compose.yml`, `deploy/kestra/flows/04_postgres_taxi.yaml`): Deployed `nova-kestra-slim:v1.3.49` (`wget`, `plugin-script-shell:1.3.1`, `plugin-jdbc-postgres:1.3.3`) + `postgres:16-alpine` (`pgdatabase`, `kestra_postgres`), omitting pgAdmin. Verified April 2020 green-taxi execution (`zoomcamp/04_postgres_taxi`) completed cleanly with `35,612` rows, `35,612` distinct `unique_row_id`s, and `701002.26` `sum_total_amount`.
+  - **Phase 2 — Kestra Integration Adapter** (`src/nova/environments/kestra_runner.py`, `src/nova/tools/kestra_tools.py`): Added `KestraEnvironment` and 6 Kestra tools reusing NOVA's tool contracts (`restart_service` restricted to `pgdatabase`, `resume_workflow` using `POST /api/v1/main/executions/{id}/restart` + bounded polling), bound incidents to Kestra `execution_id`s, preserved arbitrary Kestra task IDs, and excluded mock lockfile tools.
+  - **Phase 3 & Reflection — Agentic Fixes** (`src/nova/tools/workflow_tools.py`, `src/nova/tools/runner.py`, `src/nova/llm/client.py`, `src/nova/nodes/*.py`, `src/nova/state.py`):
+    - Removed `Scenario:` root-cause leakage from `GetWorkflowStatusTool`.
+    - Added runtime tool schema discovery via `ToolRunner.describe_tools()` and removed hardcoded catalogs and default financial workflow IDs from Gemini prompts.
+    - Preserved failed-action evidence (`prior_attempts`), enabled bounded `replanner -> triage` re-investigation, and enforced fresh-attempt + independent read-only PostgreSQL output verification.
+    - Added bounded diagnostic, planning, and outcome reflection (`reflection_history`) with `enable_reflection` ablation toggle and token/call telemetry (`src/nova/observability.py`).
+  - **Phase 4 & 5 — Live Kestra/PostgreSQL Evaluation** (`scripts/evaluate_kestra_live.py`): Evaluated Fixed Baseline vs. NOVA without Reflection vs. Full NOVA across 5 real Kestra/PostgreSQL scenarios (`source_unavailable`, `warehouse_db_unavailable`, `malformed_input`, unseen `cascading_db_then_source_unseen`, `healthy_workflow`) on `gemini-3.5-flash-lite` with same-family LLM-as-a-Judge scoring (`n=5`). Full NOVA achieved 5/5 (100%) judge root-cause accuracy vs. 4/5 without reflection (which stalled on the unseen cascading DNS/`pgdatabase` outage).
+
 ---
 
 ## 2. Test Execution & Verification Status
 - **Date**: 2026-11-26
 - **Command**: `python -m pytest -q` (API/UI `TestClient` suites run outside Windows sandbox socket restrictions)
-- **Results**: **134 passed** (100% pass rate).
+- **Results**: **138 passed** (100% pass rate, including 4 new adapter regression tests in `tests/unit/test_kestra_adapter.py`).
 - Breakdown:
+  - `test_kestra_adapter.py`: 4 tests (Kestra tool exclusion, non-`JOB_` task ID preservation & `pgdatabase`-only restart policy, Kestra E2E recovery + PostgreSQL output verification failure guard, replanner->triage re-investigation & failed-action preservation)
   - `test_streamlit_ui.py`: 2 tests (`AppTest` widget flows, dashboard refresh, custom `UNKNOWN` submission, HITL approve & reject)
   - `test_milestone11_correctness.py`: 14 tests (read-only verifier, read-only plan non-resolution, explicit `resume_workflow`, executor postconditions, `pathlib` containment & symlink rejection, unregistered resource/workflow ID rejection, empty/contradictory plan schemas, stale error clearing, single active incident & scenario reset lock, `run_id` binding, permissive approval rejection, stubbed Gemini plan/replan prompts)
   - `test_milestone10_hardening.py`: 10 tests (active lockfile protection, false-positive alert, cascading replanning via API, replay/duplicate/hash hardening, backend restart & history retrieval, LLM failure handling, concurrent simulator thread safety, interrupted task detection, telemetry preservation across restart/approval, diagnostic `check_service_status` exit-code handling)
@@ -231,5 +242,5 @@
 ---
 
 ## 4. Current State & Exact Next Step (Handoff)
-- **Current State**: Milestone 11 (reduced prototype scope) is complete and verified with 134/134 passing tests.
-- **Next Action**: Integrate an isolated executing Python/PostgreSQL ETL environment against NOVA's hardened execution, approval, and read-only verification boundaries.
+- **Current State**: Milestone 12 is complete: real DataTalksClub Kestra/PostgreSQL ETL workflow running in slim Docker containers (`nova_kestra`, `nova_kestra_postgres`, `nova_taxi_pgdatabase`), integrated via `KestraEnvironment`, with dynamic tool discovery, leakage removal, `replanner -> triage` re-investigation, bounded reflection, and live 3-arm evaluation completed.
+- **Limitations**: Evaluation sample size is `n=5` scenarios (1 run each), LLM-as-a-Judge used the same model family (`gemini-3.5-flash-lite`), `pgdatabase` container stop/start tests assume Docker CLI access, and deferred Milestone 11 production auth/locking boundaries remain local-prototype scoped.
