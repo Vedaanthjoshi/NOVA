@@ -1,0 +1,903 @@
+{
+  "model": "gemini-3.5-flash-lite",
+  "scenarios": [
+    {
+      "name": "source_unavailable",
+      "unseen": false,
+      "expected_outcome": "ESCALATED",
+      "expected_recoverable": false,
+      "baseline": {
+        "status": "FAILED",
+        "healthy_non_intervention": false,
+        "verified_recovery": false,
+        "diag_calls": 2,
+        "remed_calls": 1,
+        "llm_calls": 0,
+        "total_tokens": 0,
+        "latency_seconds": 11.388,
+        "trace": [
+          {
+            "tool": "get_workflow_status",
+            "success": true
+          },
+          {
+            "tool": "read_job_logs",
+            "job_id": "extract",
+            "success": true
+          },
+          {
+            "tool": "resume_workflow",
+            "success": false
+          }
+        ]
+      },
+      "nova_no_reflection": {
+        "incident_id": "INC_KESTRA_SOURCE_U_NOREFL_809F",
+        "execution_id": "3muxZ3op8dEVqI6EfxBa95",
+        "status": "ESCALATED",
+        "failure_type": null,
+        "implicated_resource": null,
+        "triage_summary": null,
+        "root_cause_hypothesis": null,
+        "final_summary": "Incident Escalated during investigation: The extract task failed because the downloaded remote file (green_tripdata_2021-08.csv.gz from GitHub releases) is truncated or corrupted, resulting in a gzip 'unexpected end of file' error. This is an external upstream data source defect and is unrecoverable without upstream intervention or corrections.",
+        "retry_count": 0,
+        "verified_recovery": false,
+        "healthy_non_intervention": false,
+        "partial_db_restarted": false,
+        "diagnostic_history": [
+          {
+            "step": 1,
+            "tool_name": "get_workflow_status",
+            "parameters": {
+              "execution_id": "3muxZ3op8dEVqI6EfxBa95"
+            },
+            "output": "Workflow ID: zoomcamp_eval/04_postgres_taxi_eval_source\nExecution ID: 3muxZ3op8dEVqI6EfxBa95\nExecution State: FAILED\nInputs: {'taxi': 'green', 'year': '2021', 'month': '08'}\nTotal Task Attempts: 2\nTask States:\n  - extract: status=FAILED (kestra_state=FAILED, attempts=2) | Error: gzip: stdin: unexpected end of file | io.kestra.core.models.tasks.runners.TaskException: Command failed with exit code 1 | Command failed with exit code 1\nServices: {'pgdatabase': True}",
+            "success": true,
+            "timestamp": "2026-11-26 17:29:44",
+            "rationale": "Query the Kestra execution status to identify all task IDs, task states, attempt counts, and error messages for the failed execution."
+          },
+          {
+            "step": 2,
+            "tool_name": "read_job_logs",
+            "parameters": {
+              "execution_id": "3muxZ3op8dEVqI6EfxBa95",
+              "job_id": "extract",
+              "tail_lines": 100
+            },
+            "output": "[2026-11-26T11:58:49.220836Z] DEBUG (attempt 0): Using task runner 'io.kestra.plugin.core.runner.Process'\n[2026-11-26T11:58:49.265632Z] DEBUG (attempt 0): Starting command with pid 199 [/bin/sh -c set -e\nwget -qO- https://github.com/DataTalksClub/nyc-tlc-data/releases/download/green/green_tripdata_2021-08.csv.gz | gunzip > green_tripdata_2021-08.csv\ntest -s green_tripdata_2021-08.csv]\n[2026-11-26T11:58:49.914188Z] ERROR (attempt 0): \n[2026-11-26T11:58:49.927728Z] ERROR (attempt 0): gzip: stdin: unexpected end of file\n[2026-11-26T11:58:49.940173Z] TRACE (attempt 0): Captured 1 output file(s).\n[2026-11-26T11:58:49.961287Z] ERROR (attempt 0): io.kestra.core.models.tasks.runners.TaskException: Command failed with exit code 1\n[2026-11-26T11:58:49.961287Z] ERROR (attempt 0): Command failed with exit code 1\n[2026-11-26T11:58:49.961287Z] TRACE (attempt 0): io.kestra.core.models.tasks.RunnableTaskException: io.kestra.core.models.tasks.runners.TaskException: Command failed with exit code 1\n\tat io.kestra.plugin.scripts.exec.scripts.runners.CommandsWrapper.run(CommandsWrapper.java:249)\n\tat io.kestra.plugin.scripts.shell.Commands.run(Commands.java:328)\n\tat io.kestra.plugin.scripts.shell.Commands.run(Commands.java:20)\n\tat io.kestra.worker.WorkerTaskCallable.doCall(WorkerTaskCallable.java:85)\n\tat io.kestra.worker.AbstractWorkerCallable.call(AbstractWorkerCallable.java:69)\n\tat io.kestra.worker.WorkerSecurityService.callInSecurityContext(WorkerSecurityService.java:11)\n\tat io.kestra.worker.DefaultWorker.lambda$callJob$0(DefaultWorker.java:1041)\n\tat io.kestra.core.trace.NoopTracer.inCurrentContext(NoopTracer.java:16)\n\tat io.kestra.worker.DefaultWorker.callJob(DefaultWorker.java:1036)\n\tat io.kestra.worker.DefaultWorker.runAttempt(DefaultWorker.java:973)\n\tat io.kestra.worker.DefaultWorker.run(DefaultWorker.java:754)\n\tat io.kestra.worker.DefaultWorker.handleTask(DefaultWorker.java:384)\n\tat io.kestra.worker.DefaultWorker.lambda$run$8(DefaultWorker.java:302)\n\tat io.micrometer.core.instrument.internal.TimedRunnable.run(TimedRunnable.java:49)\n\tat java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(Unknown Source)\n\tat java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(Unknown Source)\n\tat java.base/java.lang.Thread.run(Unknown Source)\nCaused by: io.kestra.core.models.tasks.runners.TaskException: Command failed with exit code 1\n\tat io.kestra.plugin.core.runner.Process.run(Process.java:154)\n\tat io.kestra.plugin.scripts.exec.scripts.runners.CommandsWrapper.run(CommandsWrapper.java:229)\n\t... 16 more\n\n[2026-11-26T11:59:34.755062Z] DEBUG (attempt 1): Using task runner 'io.kestra.plugin.core.runner.Process'\n[2026-11-26T11:59:34.761473Z] DEBUG (attempt 1): Starting command with pid 257 [/bin/sh -c set -e\nwget -qO- https://github.com/DataTalksClub/nyc-tlc-data/releases/download/green/green_tripdata_2021-08.csv.gz | gunzip > green_tripdata_2021-08.csv\ntest -s green_tripdata_2021-08.csv]\n[2026-11-26T11:59:35.154653Z] ERROR (attempt 1): \n[2026-11-26T11:59:35.155256Z] ERROR (attempt 1): gzip: stdin: unexpected end of file\n[2026-11-26T11:59:35.157666Z] TRACE (attempt 1): Captured 1 output file(s).\n[2026-11-26T11:59:35.158522Z] ERROR (attempt 1): io.kestra.core.models.tasks.runners.TaskException: Command failed with exit code 1\n[2026-11-26T11:59:35.158522Z] ERROR (attempt 1): Command failed with exit code 1\n[2026-11-26T11:59:35.158522Z] TRACE (attempt 1): io.kestra.core.models.tasks.RunnableTaskException: io.kestra.core.models.tasks.runners.TaskException: Command failed with exit code 1\n\tat io.kestra.plugin.scripts.exec.scripts.runners.CommandsWrapper.run(CommandsWrapper.java:249)\n\tat io.kestra.plugin.scripts.shell.Commands.run(Commands.java:328)\n\tat io.kestra.plugin.scripts.shell.Commands.run(Commands.java:20)\n\tat io.kestra.worker.WorkerTaskCallable.doCall(WorkerTaskCallable.java:85)\n\tat io.kestra.worker.AbstractWorkerCallable.call(AbstractWorkerCallable.java:69)\n\tat io.kestra.worker.WorkerSecurityService.callInSecurityContext(WorkerSecurityService.java:11)\n\tat io.kestra.worker.DefaultWorker.lambda$callJob$0(DefaultWorker.java:1041)\n\tat io.kestra.core.trace.NoopTracer.inCurrentContext(NoopTracer.java:16)\n\tat io.kestra.worker.DefaultWorker.callJob(DefaultWorker.java:1036)\n\tat io.kestra.worker.DefaultWorker.runAttempt(DefaultWorker.java:973)\n\tat io.kestra.worker.DefaultWorker.run(DefaultWorker.java:754)\n\tat io.kestra.worker.DefaultWorker.handleTask(DefaultWorker.java:384)\n\tat io.kestra.worker.DefaultWorker.lambda$run$8(DefaultWorker.java:302)\n\tat io.micrometer.core.instrument.internal.TimedRunnable.run(TimedRunnable.java:49)\n\tat java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(Unknown Source)\n\tat java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(Unknown Source)\n\tat java.base/java.lang.Thread.run(Unknown Source)\nCaused by: io.kestra.core.models.tasks.runners.TaskException: Command failed with exit code 1\n\tat io.kestra.plugin.core.runner.Process.run(Process.java:154)\n\tat io.kestra.plugin.scripts.exec.scripts.runners.CommandsWrapper.run(CommandsWrapper.java:229)\n\t... 16 more\n",
+            "success": true,
+            "timestamp": "2026-11-26 17:29:49",
+            "rationale": "Read the detailed logs of the failed 'extract' task to inspect the exact commands executed and understand why gzip encountered an unexpected end of file."
+          }
+        ],
+        "execution_history": [],
+        "verification_history": [],
+        "reflection_history": [],
+        "llm_calls": 3,
+        "diag_calls": 2,
+        "remed_calls": 0,
+        "input_tokens": 8038,
+        "output_tokens": 333,
+        "total_tokens": 8371,
+        "latency_seconds": 12.519,
+        "judge": {
+          "root_cause_accurate": true,
+          "tool_selection_accurate": true,
+          "evidence_groundedness_score": 5,
+          "plan_correctness_score": 5,
+          "reflection_effectiveness_score": 5,
+          "justification": "The agent correctly diagnosed the incident by inspecting workflow execution status and reading job logs, which revealed a corrupted/truncated remote gzip file from the upstream GitHub release. It appropriately escalated the issue as an external upstream data defect that cannot be recovered automatically."
+        }
+      },
+      "nova_full": {
+        "incident_id": "INC_KESTRA_SOURCE_U_REFL_5287",
+        "execution_id": "3muxZ3op8dEVqI6EfxBa95",
+        "status": "ESCALATED",
+        "failure_type": null,
+        "implicated_resource": null,
+        "triage_summary": null,
+        "root_cause_hypothesis": null,
+        "final_summary": "Incident Escalated during investigation: The extract task failed due to an unexpected end of file from gunzip while downloading and decompressing the remote archive from GitHub releases (https://github.com/DataTalksClub/nyc-tlc-data/releases/download/green/green_tripdata_2021-08.csv.gz). This indicates a corrupted or incomplete upstream file release on GitHub or external source issue, which is unrecoverable via internal automated remediation tools.",
+        "retry_count": 0,
+        "verified_recovery": false,
+        "healthy_non_intervention": false,
+        "partial_db_restarted": false,
+        "diagnostic_history": [
+          {
+            "step": 1,
+            "tool_name": "get_workflow_status",
+            "parameters": {
+              "execution_id": "3muxZ3op8dEVqI6EfxBa95"
+            },
+            "output": "Workflow ID: zoomcamp_eval/04_postgres_taxi_eval_source\nExecution ID: 3muxZ3op8dEVqI6EfxBa95\nExecution State: FAILED\nInputs: {'taxi': 'green', 'year': '2021', 'month': '08'}\nTotal Task Attempts: 2\nTask States:\n  - extract: status=FAILED (kestra_state=FAILED, attempts=2) | Error: gzip: stdin: unexpected end of file | io.kestra.core.models.tasks.runners.TaskException: Command failed with exit code 1 | Command failed with exit code 1\nServices: {'pgdatabase': True}",
+            "success": true,
+            "timestamp": "2026-11-26 17:30:05",
+            "rationale": "Fetch the execution status and task states for Kestra execution '3muxZ3op8dEVqI6EfxBa95' to identify which specific task failed and retrieve its error message."
+          },
+          {
+            "step": 2,
+            "tool_name": "read_job_logs",
+            "parameters": {
+              "execution_id": "3muxZ3op8dEVqI6EfxBa95",
+              "job_id": "extract",
+              "tail_lines": 50
+            },
+            "output": "[2026-11-26T11:58:49.220836Z] DEBUG (attempt 0): Using task runner 'io.kestra.plugin.core.runner.Process'\n[2026-11-26T11:58:49.265632Z] DEBUG (attempt 0): Starting command with pid 199 [/bin/sh -c set -e\nwget -qO- https://github.com/DataTalksClub/nyc-tlc-data/releases/download/green/green_tripdata_2021-08.csv.gz | gunzip > green_tripdata_2021-08.csv\ntest -s green_tripdata_2021-08.csv]\n[2026-11-26T11:58:49.914188Z] ERROR (attempt 0): \n[2026-11-26T11:58:49.927728Z] ERROR (attempt 0): gzip: stdin: unexpected end of file\n[2026-11-26T11:58:49.940173Z] TRACE (attempt 0): Captured 1 output file(s).\n[2026-11-26T11:58:49.961287Z] ERROR (attempt 0): io.kestra.core.models.tasks.runners.TaskException: Command failed with exit code 1\n[2026-11-26T11:58:49.961287Z] ERROR (attempt 0): Command failed with exit code 1\n[2026-11-26T11:58:49.961287Z] TRACE (attempt 0): io.kestra.core.models.tasks.RunnableTaskException: io.kestra.core.models.tasks.runners.TaskException: Command failed with exit code 1\n\tat io.kestra.plugin.scripts.exec.scripts.runners.CommandsWrapper.run(CommandsWrapper.java:249)\n\tat io.kestra.plugin.scripts.shell.Commands.run(Commands.java:328)\n\tat io.kestra.plugin.scripts.shell.Commands.run(Commands.java:20)\n\tat io.kestra.worker.WorkerTaskCallable.doCall(WorkerTaskCallable.java:85)\n\tat io.kestra.worker.AbstractWorkerCallable.call(AbstractWorkerCallable.java:69)\n\tat io.kestra.worker.WorkerSecurityService.callInSecurityContext(WorkerSecurityService.java:11)\n\tat io.kestra.worker.DefaultWorker.lambda$callJob$0(DefaultWorker.java:1041)\n\tat io.kestra.core.trace.NoopTracer.inCurrentContext(NoopTracer.java:16)\n\tat io.kestra.worker.DefaultWorker.callJob(DefaultWorker.java:1036)\n\tat io.kestra.worker.DefaultWorker.runAttempt(DefaultWorker.java:973)\n\tat io.kestra.worker.DefaultWorker.run(DefaultWorker.java:754)\n\tat io.kestra.worker.DefaultWorker.handleTask(DefaultWorker.java:384)\n\tat io.kestra.worker.DefaultWorker.lambda$run$8(DefaultWorker.java:302)\n\tat io.micrometer.core.instrument.internal.TimedRunnable.run(TimedRunnable.java:49)\n\tat java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(Unknown Source)\n\tat java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(Unknown Source)\n\tat java.base/java.lang.Thread.run(Unknown Source)\nCaused by: io.kestra.core.models.tasks.runners.TaskException: Command failed with exit code 1\n\tat io.kestra.plugin.core.runner.Process.run(Process.java:154)\n\tat io.kestra.plugin.scripts.exec.scripts.runners.CommandsWrapper.run(CommandsWrapper.java:229)\n\t... 16 more\n\n[2026-11-26T11:59:34.755062Z] DEBUG (attempt 1): Using task runner 'io.kestra.plugin.core.runner.Process'\n[2026-11-26T11:59:34.761473Z] DEBUG (attempt 1): Starting command with pid 257 [/bin/sh -c set -e\nwget -qO- https://github.com/DataTalksClub/nyc-tlc-data/releases/download/green/green_tripdata_2021-08.csv.gz | gunzip > green_tripdata_2021-08.csv\ntest -s green_tripdata_2021-08.csv]\n[2026-11-26T11:59:35.154653Z] ERROR (attempt 1): \n[2026-11-26T11:59:35.155256Z] ERROR (attempt 1): gzip: stdin: unexpected end of file\n[2026-11-26T11:59:35.157666Z] TRACE (attempt 1): Captured 1 output file(s).\n[2026-11-26T11:59:35.158522Z] ERROR (attempt 1): io.kestra.core.models.tasks.runners.TaskException: Command failed with exit code 1\n[2026-11-26T11:59:35.158522Z] ERROR (attempt 1): Command failed with exit code 1\n[2026-11-26T11:59:35.158522Z] TRACE (attempt 1): io.kestra.core.models.tasks.RunnableTaskException: io.kestra.core.models.tasks.runners.TaskException: Command failed with exit code 1\n\tat io.kestra.plugin.scripts.exec.scripts.runners.CommandsWrapper.run(CommandsWrapper.java:249)\n\tat io.kestra.plugin.scripts.shell.Commands.run(Commands.java:328)\n\tat io.kestra.plugin.scripts.shell.Commands.run(Commands.java:20)\n\tat io.kestra.worker.WorkerTaskCallable.doCall(WorkerTaskCallable.java:85)\n\tat io.kestra.worker.AbstractWorkerCallable.call(AbstractWorkerCallable.java:69)\n\tat io.kestra.worker.WorkerSecurityService.callInSecurityContext(WorkerSecurityService.java:11)\n\tat io.kestra.worker.DefaultWorker.lambda$callJob$0(DefaultWorker.java:1041)\n\tat io.kestra.core.trace.NoopTracer.inCurrentContext(NoopTracer.java:16)\n\tat io.kestra.worker.DefaultWorker.callJob(DefaultWorker.java:1036)\n\tat io.kestra.worker.DefaultWorker.runAttempt(DefaultWorker.java:973)\n\tat io.kestra.worker.DefaultWorker.run(DefaultWorker.java:754)\n\tat io.kestra.worker.DefaultWorker.handleTask(DefaultWorker.java:384)\n\tat io.kestra.worker.DefaultWorker.lambda$run$8(DefaultWorker.java:302)\n\tat io.micrometer.core.instrument.internal.TimedRunnable.run(TimedRunnable.java:49)\n\tat java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(Unknown Source)\n\tat java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(Unknown Source)\n\tat java.base/java.lang.Thread.run(Unknown Source)\nCaused by: io.kestra.core.models.tasks.runners.TaskException: Command failed with exit code 1\n\tat io.kestra.plugin.core.runner.Process.run(Process.java:154)\n\tat io.kestra.plugin.scripts.exec.scripts.runners.CommandsWrapper.run(CommandsWrapper.java:229)\n\t... 16 more\n",
+            "success": true,
+            "timestamp": "2026-11-26 17:30:08",
+            "rationale": "Read the logs for the failed 'extract' task to inspect the exact commands executed and the full stack trace or stderr leading to the gzip unexpected end of file error."
+          }
+        ],
+        "execution_history": [],
+        "verification_history": [],
+        "reflection_history": [
+          {
+            "phase": "diagnostic",
+            "step": 1,
+            "evidence_sufficient": false,
+            "alternative_hypotheses": [
+              "Database connection failure during ingestion",
+              "Upstream data source unavailable or timeout",
+              "Malformed input data causing task failure"
+            ],
+            "remaining_uncertainty": "Exact failed task ID and error message are currently unknown."
+          },
+          {
+            "phase": "diagnostic",
+            "step": 2,
+            "evidence_sufficient": false,
+            "alternative_hypotheses": [
+              "Truncated or corrupted download from upstream source",
+              "Upstream data source returned incomplete compressed stream",
+              "Disk space exhaustion during extraction"
+            ],
+            "remaining_uncertainty": "Need to examine task logs to see if the download itself failed, returned a 404/corrupt file, or encountered an unexpected EOF during decompression."
+          }
+        ],
+        "llm_calls": 3,
+        "diag_calls": 2,
+        "remed_calls": 0,
+        "input_tokens": 8594,
+        "output_tokens": 634,
+        "total_tokens": 9228,
+        "latency_seconds": 14.226,
+        "judge": {
+          "root_cause_accurate": true,
+          "tool_selection_accurate": true,
+          "evidence_groundedness_score": 5,
+          "plan_correctness_score": 5,
+          "reflection_effectiveness_score": 5,
+          "justification": "The agent correctly identified the failure via workflow status and job logs, accurately diagnosed an external upstream file issue causing a gunzip unexpected end of file error, and correctly escalated the incident since it was unrecoverable."
+        }
+      }
+    },
+    {
+      "name": "warehouse_db_unavailable",
+      "unseen": false,
+      "expected_outcome": "RESOLVED",
+      "expected_recoverable": true,
+      "baseline": {
+        "status": "FAILED",
+        "healthy_non_intervention": false,
+        "verified_recovery": false,
+        "diag_calls": 2,
+        "remed_calls": 1,
+        "llm_calls": 0,
+        "total_tokens": 0,
+        "latency_seconds": 21.68,
+        "trace": [
+          {
+            "tool": "get_workflow_status",
+            "success": true
+          },
+          {
+            "tool": "read_job_logs",
+            "job_id": "if_green_taxi",
+            "success": true
+          },
+          {
+            "tool": "resume_workflow",
+            "success": false
+          }
+        ]
+      },
+      "nova_no_reflection": {
+        "incident_id": "INC_KESTRA_WAREHOUS_NOREFL_4E3C",
+        "execution_id": "6yt0mOiTYN5BZsdfnuTkmd",
+        "status": "RESOLVED",
+        "failure_type": "SERVICE_OFFLINE",
+        "implicated_resource": "pgdatabase",
+        "triage_summary": "Workflow execution failed during the 'green_create_table' task because PostgreSQL database connection failed. Service health probe confirmed 'pgdatabase' is currently offline/unreachable.",
+        "root_cause_hypothesis": "The PostgreSQL database service (pgdatabase) is down or unreachable, causing connection attempts by the Kestra pipeline tasks to fail.",
+        "final_summary": "Incident Successfully Resolved: Action ACT_01_02 executed, and workflow state independently confirms 100% job completion. PostgreSQL read-only verification passed for public.green_tripdata (green_tripdata_2020-04.csv): row_count=35612, distinct_ids=35612, sum_total_amount=701002.26.",
+        "retry_count": 0,
+        "verified_recovery": true,
+        "healthy_non_intervention": false,
+        "partial_db_restarted": true,
+        "diagnostic_history": [
+          {
+            "step": 1,
+            "tool_name": "get_workflow_status",
+            "parameters": {
+              "execution_id": "6yt0mOiTYN5BZsdfnuTkmd"
+            },
+            "output": "Workflow ID: zoomcamp/04_postgres_taxi\nExecution ID: 6yt0mOiTYN5BZsdfnuTkmd\nExecution State: FAILED\nInputs: {'taxi': 'green', 'year': '2020', 'month': '04'}\nTotal Task Attempts: 5\nTask States:\n  - set_label: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - extract: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - if_yellow_taxi: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - if_green_taxi: status=FAILED (kestra_state=FAILED, attempts=1)\n  - green_create_table: status=FAILED (kestra_state=FAILED, attempts=1) | Error: org.postgresql.util.PSQLException: The connection attempt failed. | The connection attempt failed.\npgdatabase\nServices: {'pgdatabase': False}",
+            "success": true,
+            "timestamp": "2026-11-26 17:32:06",
+            "rationale": "Query the Kestra execution status to identify the failed task ID, state, and error message."
+          }
+        ],
+        "execution_history": [
+          {
+            "action_id": "ACT_01_01",
+            "tool_name": "restart_service",
+            "executed_at": "2026-11-26 17:32:29",
+            "exit_code": 0,
+            "stdout": "Container 'nova_taxi_pgdatabase' started and PostgreSQL is healthy.",
+            "stderr": "",
+            "duration_seconds": 3.5753,
+            "success": true,
+            "action_hash": "c89e936f49449e15",
+            "idempotency_token": null,
+            "approved_by": "eval_operator",
+            "approver_role": "SRE_LEAD",
+            "approval_id": "APPR_INC_KESTRA_WAREHOUS_NOREFL_4E3C_ACT_01_01_c89e936f"
+          },
+          {
+            "action_id": "ACT_01_02",
+            "tool_name": "resume_workflow",
+            "executed_at": "2026-11-26 17:32:33",
+            "exit_code": 0,
+            "stdout": "Kestra execution '6yt0mOiTYN5BZsdfnuTkmd' (zoomcamp/04_postgres_taxi) restarted and completed with state SUCCESS (total_attempts=12).",
+            "stderr": "",
+            "duration_seconds": 9.9926,
+            "success": true,
+            "action_hash": "d1b532c915fc968a",
+            "idempotency_token": null,
+            "approved_by": null,
+            "approver_role": null,
+            "approval_id": null
+          }
+        ],
+        "verification_history": [
+          {
+            "action_id": "ACT_01_02",
+            "verified_at": "2026-11-26 17:32:45",
+            "passed": true,
+            "evidence": "Read-only state verification passed: workflow state confirms all 11 tasks/jobs completed with status SUCCESS. PostgreSQL read-only verification passed for public.green_tripdata (green_tripdata_2020-04.csv): row_count=35612, distinct_ids=35612, sum_total_amount=701002.26.",
+            "details": {
+              "all_jobs_success": true,
+              "workflow_id": "zoomcamp/04_postgres_taxi",
+              "run_id": "6yt0mOiTYN5BZsdfnuTkmd",
+              "output_verification": {
+                "table": "public.green_tripdata",
+                "filename": "green_tripdata_2020-04.csv",
+                "row_count": 35612,
+                "distinct_ids": 35612,
+                "sum_total_amount": 701002.26
+              }
+            }
+          }
+        ],
+        "reflection_history": [],
+        "llm_calls": 3,
+        "diag_calls": 1,
+        "remed_calls": 2,
+        "input_tokens": 3753,
+        "output_tokens": 542,
+        "total_tokens": 4295,
+        "latency_seconds": 48.076,
+        "judge": {
+          "root_cause_accurate": true,
+          "tool_selection_accurate": true,
+          "evidence_groundedness_score": 5,
+          "plan_correctness_score": 5,
+          "reflection_effectiveness_score": 3,
+          "justification": "The agent correctly identified that the PostgreSQL database service (pgdatabase) was offline, causing the Kestra workflow task 'green_create_table' to fail due to connection refusals. It successfully used workflow status tools to pinpoint the error, restarted the database container, resumed the workflow, and verified the successful execution and data integrity via database queries. The reflection score is neutral (3) due to an empty reflection history, though the execution plan and troubleshooting steps were fully correct."
+        }
+      },
+      "nova_full": {
+        "incident_id": "INC_KESTRA_WAREHOUS_REFL_F80E",
+        "execution_id": "6z9zotJ1BOlYXkh9Fw5fNv",
+        "status": "RESOLVED",
+        "failure_type": "SERVICE_OFFLINE",
+        "implicated_resource": "pgdatabase",
+        "triage_summary": "Workflow execution 6z9zotJ1BOlYXkh9Fw5fNv failed at green_create_table due to a PostgreSQL connection failure (PSQLException: The connection attempt failed). Health probe for 'pgdatabase' returned False, confirming the database service is currently offline or unreachable.",
+        "root_cause_hypothesis": "The PostgreSQL database service ('pgdatabase') is down or unreachable, causing the table creation step to fail when attempting to connect.",
+        "final_summary": "Incident Successfully Resolved: Action ACT_01_02 executed, and workflow state independently confirms 100% job completion. PostgreSQL read-only verification passed for public.green_tripdata (green_tripdata_2020-04.csv): row_count=35612, distinct_ids=35612, sum_total_amount=701002.26.",
+        "retry_count": 0,
+        "verified_recovery": true,
+        "healthy_non_intervention": false,
+        "partial_db_restarted": true,
+        "diagnostic_history": [
+          {
+            "step": 1,
+            "tool_name": "get_workflow_status",
+            "parameters": {
+              "execution_id": "6z9zotJ1BOlYXkh9Fw5fNv"
+            },
+            "output": "Workflow ID: zoomcamp/04_postgres_taxi\nExecution ID: 6z9zotJ1BOlYXkh9Fw5fNv\nExecution State: FAILED\nInputs: {'taxi': 'green', 'year': '2020', 'month': '04'}\nTotal Task Attempts: 5\nTask States:\n  - set_label: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - extract: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - if_yellow_taxi: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - if_green_taxi: status=FAILED (kestra_state=FAILED, attempts=1)\n  - green_create_table: status=FAILED (kestra_state=FAILED, attempts=1) | Error: org.postgresql.util.PSQLException: The connection attempt failed. | The connection attempt failed.\npgdatabase\nServices: {'pgdatabase': False}",
+            "success": true,
+            "timestamp": "2026-11-26 17:33:33",
+            "rationale": "Query the workflow execution status to identify the actual task IDs, states, attempt counts, and error messages for the failed execution."
+          }
+        ],
+        "execution_history": [
+          {
+            "action_id": "ACT_01_01",
+            "tool_name": "restart_service",
+            "executed_at": "2026-11-26 17:33:58",
+            "exit_code": 0,
+            "stdout": "Container 'nova_taxi_pgdatabase' started and PostgreSQL is healthy.",
+            "stderr": "",
+            "duration_seconds": 3.5712,
+            "success": true,
+            "action_hash": "dca42d47f3b2deb0",
+            "idempotency_token": null,
+            "approved_by": "eval_operator",
+            "approver_role": "SRE_LEAD",
+            "approval_id": "APPR_INC_KESTRA_WAREHOUS_REFL_F80E_ACT_01_01_dca42d47"
+          },
+          {
+            "action_id": "ACT_01_02",
+            "tool_name": "resume_workflow",
+            "executed_at": "2026-11-26 17:34:03",
+            "exit_code": 0,
+            "stdout": "Kestra execution '6z9zotJ1BOlYXkh9Fw5fNv' (zoomcamp/04_postgres_taxi) restarted and completed with state SUCCESS (total_attempts=12).",
+            "stderr": "",
+            "duration_seconds": 9.5748,
+            "success": true,
+            "action_hash": "58e6a69a4f72f143",
+            "idempotency_token": null,
+            "approved_by": null,
+            "approver_role": null,
+            "approval_id": null
+          }
+        ],
+        "verification_history": [
+          {
+            "action_id": "ACT_01_02",
+            "verified_at": "2026-11-26 17:34:14",
+            "passed": true,
+            "evidence": "Read-only state verification passed: workflow state confirms all 11 tasks/jobs completed with status SUCCESS. PostgreSQL read-only verification passed for public.green_tripdata (green_tripdata_2020-04.csv): row_count=35612, distinct_ids=35612, sum_total_amount=701002.26.",
+            "details": {
+              "all_jobs_success": true,
+              "workflow_id": "zoomcamp/04_postgres_taxi",
+              "run_id": "6z9zotJ1BOlYXkh9Fw5fNv",
+              "output_verification": {
+                "table": "public.green_tripdata",
+                "filename": "green_tripdata_2020-04.csv",
+                "row_count": 35612,
+                "distinct_ids": 35612,
+                "sum_total_amount": 701002.26
+              }
+            }
+          }
+        ],
+        "reflection_history": [
+          {
+            "phase": "diagnostic",
+            "step": 1,
+            "evidence_sufficient": false,
+            "alternative_hypotheses": [
+              "Task failure due to database connectivity issue",
+              "Task failure due to upstream source unavailability",
+              "Task failure due to malformed input data"
+            ],
+            "remaining_uncertainty": "Exact failed task ID and error message are unknown until workflow status is retrieved."
+          },
+          {
+            "phase": "diagnostic",
+            "step": 2,
+            "evidence_sufficient": true,
+            "alternative_hypotheses": [
+              "Transient network glitch between Kestra worker and PostgreSQL",
+              "Incorrect database credentials provided in workflow configuration"
+            ],
+            "remaining_uncertainty": null
+          },
+          {
+            "phase": "planning",
+            "retry_count": 0,
+            "addresses_root_cause": true,
+            "contradicts_prior_attempts": false,
+            "strategy_assessment": "The plan directly addresses the offline database service by restarting it and then resuming the workflow execution, which is the correct and necessary remediation path for SERVICE_OFFLINE on pgdatabase."
+          }
+        ],
+        "llm_calls": 3,
+        "diag_calls": 1,
+        "remed_calls": 2,
+        "input_tokens": 4238,
+        "output_tokens": 819,
+        "total_tokens": 5057,
+        "latency_seconds": 49.063,
+        "judge": {
+          "root_cause_accurate": true,
+          "tool_selection_accurate": true,
+          "evidence_groundedness_score": 5,
+          "plan_correctness_score": 5,
+          "reflection_effectiveness_score": 5,
+          "justification": "The agent successfully identified the root cause as the PostgreSQL database service being offline, verified it using workflow status and health checks, executed the correct remediation (restarting the database service and resuming the workflow), and verified the success of the pipeline through database queries."
+        }
+      }
+    },
+    {
+      "name": "malformed_input",
+      "unseen": false,
+      "expected_outcome": "ESCALATED",
+      "expected_recoverable": false,
+      "baseline": {
+        "status": "FAILED",
+        "healthy_non_intervention": false,
+        "verified_recovery": false,
+        "diag_calls": 2,
+        "remed_calls": 1,
+        "llm_calls": 0,
+        "total_tokens": 0,
+        "latency_seconds": 10.72,
+        "trace": [
+          {
+            "tool": "get_workflow_status",
+            "success": true
+          },
+          {
+            "tool": "read_job_logs",
+            "job_id": "load_staging_csv",
+            "success": true
+          },
+          {
+            "tool": "resume_workflow",
+            "success": false
+          }
+        ]
+      },
+      "nova_no_reflection": {
+        "incident_id": "INC_KESTRA_MALFORME_NOREFL_945A",
+        "execution_id": "2RoPCFH58Jsgt6z4KXhHJo",
+        "status": "ESCALATED",
+        "failure_type": "DATA_CORRUPTION",
+        "implicated_resource": "green_tripdata_eval_staging / load_staging_csv",
+        "triage_summary": "The Kestra task 'load_staging_csv' failed because PostgreSQL rejected the input data due to an invalid integer syntax (\"CORRUPT_INT\") in line 2, column passenger_count during the COPY command.",
+        "root_cause_hypothesis": "The input CSV file contains corrupt or malformed data where an integer column receives a string value (\"CORRUPT_INT\"), causing database ingestion to fail.",
+        "final_summary": "Incident Escalated: The failure is caused by data corruption and malformed input data (invalid integer syntax 'CORRUPT_INT' in line 2, column passenger_count of the CSV file during PostgreSQL COPY), which cannot be resolved by standard orchestrator tools or restarting services.",
+        "retry_count": 0,
+        "verified_recovery": false,
+        "healthy_non_intervention": false,
+        "partial_db_restarted": false,
+        "diagnostic_history": [
+          {
+            "step": 1,
+            "tool_name": "get_workflow_status",
+            "parameters": {
+              "execution_id": "2RoPCFH58Jsgt6z4KXhHJo"
+            },
+            "output": "Workflow ID: zoomcamp_eval/04_postgres_taxi_eval_malformed\nExecution ID: 2RoPCFH58Jsgt6z4KXhHJo\nExecution State: FAILED\nInputs: {}\nTotal Task Attempts: 4\nTask States:\n  - prepare_payload: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - ensure_staging_table: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - load_staging_csv: status=FAILED (kestra_state=FAILED, attempts=2) | Error: ERROR: invalid input syntax for type integer: \"CORRUPT_INT\"\n  Where: COPY green_tripdata_eval_staging, line 2, column passenger_count: \"CORRUPT_INT\" | ERROR: invalid input syntax for type integer: \"CORRUPT_INT\"\n  Where: COPY green_tripdata_eval_staging, line 2, column passenger_count: \"CORRUPT_INT\"\nServices: {'pgdatabase': True}",
+            "success": true,
+            "timestamp": "2026-11-26 17:34:37",
+            "rationale": "Query the Kestra execution status to identify the list of tasks, their states, attempt counts, and any specific task error messages for the failed execution."
+          }
+        ],
+        "execution_history": [],
+        "verification_history": [],
+        "reflection_history": [],
+        "llm_calls": 3,
+        "diag_calls": 1,
+        "remed_calls": 0,
+        "input_tokens": 3851,
+        "output_tokens": 373,
+        "total_tokens": 4224,
+        "latency_seconds": 19.712,
+        "judge": {
+          "root_cause_accurate": true,
+          "tool_selection_accurate": true,
+          "evidence_groundedness_score": 5,
+          "plan_correctness_score": 5,
+          "reflection_effectiveness_score": 5,
+          "justification": "The agent correctly identified the exact root cause from the workflow execution status (invalid integer syntax 'CORRUPT_INT' in line 2, column passenger_count during PostgreSQL COPY). It accurately determined that the failure was due to malformed input data rather than an infrastructure or service issue, correctly escalating the incident as expected by the ground truth."
+        }
+      },
+      "nova_full": {
+        "incident_id": "INC_KESTRA_MALFORME_REFL_9035",
+        "execution_id": "2RoPCFH58Jsgt6z4KXhHJo",
+        "status": "ESCALATED",
+        "failure_type": null,
+        "implicated_resource": null,
+        "triage_summary": null,
+        "root_cause_hypothesis": null,
+        "final_summary": "Incident Escalated during investigation: Workflow failed due to malformed input data (invalid input syntax for type integer: \"CORRUPT_INT\" during PostgreSQL COPY command into passenger_count column). This is a data corruption / malformed input issue in the source data file, which is unrecoverable without upstream data correction.",
+        "retry_count": 0,
+        "verified_recovery": false,
+        "healthy_non_intervention": false,
+        "partial_db_restarted": false,
+        "diagnostic_history": [
+          {
+            "step": 1,
+            "tool_name": "get_workflow_status",
+            "parameters": {
+              "execution_id": "2RoPCFH58Jsgt6z4KXhHJo"
+            },
+            "output": "Workflow ID: zoomcamp_eval/04_postgres_taxi_eval_malformed\nExecution ID: 2RoPCFH58Jsgt6z4KXhHJo\nExecution State: FAILED\nInputs: {}\nTotal Task Attempts: 4\nTask States:\n  - prepare_payload: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - ensure_staging_table: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - load_staging_csv: status=FAILED (kestra_state=FAILED, attempts=2) | Error: ERROR: invalid input syntax for type integer: \"CORRUPT_INT\"\n  Where: COPY green_tripdata_eval_staging, line 2, column passenger_count: \"CORRUPT_INT\" | ERROR: invalid input syntax for type integer: \"CORRUPT_INT\"\n  Where: COPY green_tripdata_eval_staging, line 2, column passenger_count: \"CORRUPT_INT\"\nServices: {'pgdatabase': True}",
+            "success": true,
+            "timestamp": "2026-11-26 17:34:58",
+            "rationale": "Query the Kestra execution status to identify failed tasks, their states, and error messages for execution 2RoPCFH58Jsgt6z4KXhHJo."
+          }
+        ],
+        "execution_history": [],
+        "verification_history": [],
+        "reflection_history": [
+          {
+            "phase": "diagnostic",
+            "step": 1,
+            "evidence_sufficient": false,
+            "alternative_hypotheses": [
+              "Task failed due to database connectivity issues",
+              "Task failed due to upstream source unavailability",
+              "Task failed due to malformed input data"
+            ],
+            "remaining_uncertainty": "Exact failed task ID and error message are currently unknown."
+          }
+        ],
+        "llm_calls": 2,
+        "diag_calls": 1,
+        "remed_calls": 0,
+        "input_tokens": 2870,
+        "output_tokens": 343,
+        "total_tokens": 3213,
+        "latency_seconds": 14.606,
+        "judge": {
+          "root_cause_accurate": true,
+          "tool_selection_accurate": true,
+          "evidence_groundedness_score": 5,
+          "plan_correctness_score": 5,
+          "reflection_effectiveness_score": 5,
+          "justification": "The agent correctly identified the root cause from the single tool output (malformed CSV input with 'CORRUPT_INT' for integer column passenger_count causing a PostgreSQL CopyIn/COPY failure). The tool selection (`get_workflow_status`) was accurate and directly provided the necessary error traceback and healthy database status. The agent successfully recognized that the issue was unrecoverable due to upstream data corruption and correctly escalated the incident."
+        }
+      }
+    },
+    {
+      "name": "cascading_db_then_source_unseen",
+      "unseen": true,
+      "expected_outcome": "ESCALATED",
+      "expected_recoverable": false,
+      "baseline": {
+        "status": "FAILED",
+        "healthy_non_intervention": false,
+        "verified_recovery": false,
+        "diag_calls": 2,
+        "remed_calls": 1,
+        "llm_calls": 0,
+        "total_tokens": 0,
+        "latency_seconds": 19.797,
+        "trace": [
+          {
+            "tool": "get_workflow_status",
+            "success": true
+          },
+          {
+            "tool": "read_job_logs",
+            "job_id": "init_warehouse_check",
+            "success": true
+          },
+          {
+            "tool": "resume_workflow",
+            "success": false
+          }
+        ]
+      },
+      "nova_no_reflection": {
+        "incident_id": "INC_KESTRA_CASCADIN_NOREFL_4886",
+        "execution_id": "3azLAOMxgXMgoTOyugTRii",
+        "status": "ESCALATED",
+        "failure_type": "SERVICE_OFFLINE",
+        "implicated_resource": "pgdatabase",
+        "triage_summary": "The workflow execution failed at the 'init_warehouse_check' task due to a PostgreSQL connection failure caused by an UnknownHostException for the host 'pgdatabase'.",
+        "root_cause_hypothesis": "The database service 'pgdatabase' is either offline, unreachable, or improperly configured regarding DNS/hostname resolution within the environment.",
+        "final_summary": "Incident Escalated: The database service 'pgdatabase' failed with an UnknownHostException (DNS/hostname resolution failure for 'pgdatabase'), and the triage assessment confirms is_recoverable=False. Restarting the database service will not resolve a hostname/DNS resolution issue.",
+        "retry_count": 0,
+        "verified_recovery": false,
+        "healthy_non_intervention": false,
+        "partial_db_restarted": false,
+        "diagnostic_history": [
+          {
+            "step": 1,
+            "tool_name": "get_workflow_status",
+            "parameters": {
+              "execution_id": "3azLAOMxgXMgoTOyugTRii"
+            },
+            "output": "Workflow ID: zoomcamp_eval/04_postgres_taxi_eval_cascade\nExecution ID: 3azLAOMxgXMgoTOyugTRii\nExecution State: FAILED\nInputs: {}\nTotal Task Attempts: 1\nTask States:\n  - init_warehouse_check: status=FAILED (kestra_state=FAILED, attempts=1) | Error: org.postgresql.util.PSQLException: The connection attempt failed. | The connection attempt failed.\npgdatabase\nServices: {'pgdatabase': False}",
+            "success": true,
+            "timestamp": "2026-11-26 17:35:59",
+            "rationale": "Query Kestra execution status to identify actual task IDs, task states, attempt counts, and error messages for the failed execution."
+          },
+          {
+            "step": 2,
+            "tool_name": "read_job_logs",
+            "parameters": {
+              "execution_id": "3azLAOMxgXMgoTOyugTRii",
+              "job_id": "init_warehouse_check",
+              "tail_lines": 50
+            },
+            "output": "[2026-11-26T12:05:50.551406Z] ERROR (attempt 0): org.postgresql.util.PSQLException: The connection attempt failed.\n[2026-11-26T12:05:50.551406Z] ERROR (attempt 0): The connection attempt failed.\npgdatabase\n[2026-11-26T12:05:50.551406Z] TRACE (attempt 0): java.lang.RuntimeException: org.postgresql.util.PSQLException: The connection attempt failed.\n\tat io.kestra.plugin.jdbc.AbstractJdbcQueries.run(AbstractJdbcQueries.java:125)\n\tat io.kestra.plugin.jdbc.AbstractJdbcQueries.run(AbstractJdbcQueries.java:26)\n\tat io.kestra.worker.WorkerTaskCallable.doCall(WorkerTaskCallable.java:85)\n\tat io.kestra.worker.AbstractWorkerCallable.call(AbstractWorkerCallable.java:69)\n\tat io.kestra.worker.WorkerSecurityService.callInSecurityContext(WorkerSecurityService.java:11)\n\tat io.kestra.worker.DefaultWorker.lambda$callJob$0(DefaultWorker.java:1041)\n\tat io.kestra.core.trace.NoopTracer.inCurrentContext(NoopTracer.java:16)\n\tat io.kestra.worker.DefaultWorker.callJob(DefaultWorker.java:1036)\n\tat io.kestra.worker.DefaultWorker.runAttempt(DefaultWorker.java:973)\n\tat io.kestra.worker.DefaultWorker.run(DefaultWorker.java:754)\n\tat io.kestra.worker.DefaultWorker.handleTask(DefaultWorker.java:384)\n\tat io.kestra.worker.DefaultWorker.lambda$run$8(DefaultWorker.java:302)\n\tat io.micrometer.core.instrument.internal.TimedRunnable.run(TimedRunnable.java:49)\n\tat java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(Unknown Source)\n\tat java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(Unknown Source)\n\tat java.base/java.lang.Thread.run(Unknown Source)\nCaused by: org.postgresql.util.PSQLException: The connection attempt failed.\n\tat org.postgresql.core.v3.ConnectionFactoryImpl.openConnectionImpl(ConnectionFactoryImpl.java:385)\n\tat org.postgresql.core.ConnectionFactory.openConnection(ConnectionFactory.java:57)\n\tat org.postgresql.jdbc.PgConnection.<init>(PgConnection.java:279)\n\tat org.postgresql.Driver.makeConnection(Driver.java:448)\n\tat org.postgresql.Driver.connect(Driver.java:298)\n\tat java.sql/java.sql.DriverManager.getConnection(Unknown Source)\n\tat java.sql/java.sql.DriverManager.getConnection(Unknown Source)\n\tat io.kestra.plugin.jdbc.JdbcConnectionInterface.connection(JdbcConnectionInterface.java:102)\n\tat io.kestra.plugin.jdbc.AbstractJdbcQueries.run(AbstractJdbcQueries.java:56)\n\t... 15 more\nCaused by: java.net.UnknownHostException: pgdatabase\n\tat java.base/sun.nio.ch.NioSocketImpl.connect(Unknown Source)\n\tat java.base/java.net.SocksSocketImpl.connect(Unknown Source)\n\tat java.base/java.net.Socket.connect(Unknown Source)\n\tat org.postgresql.core.PGStream.createSocket(PGStream.java:261)\n\tat org.postgresql.core.PGStream.<init>(PGStream.java:122)\n\tat org.postgresql.core.v3.ConnectionFactoryImpl.tryConnect(ConnectionFactoryImpl.java:146)\n\tat org.postgresql.core.v3.ConnectionFactoryImpl.openConnectionImpl(ConnectionFactoryImpl.java:289)\n\t... 23 more\n",
+            "success": true,
+            "timestamp": "2026-11-26 17:36:04",
+            "rationale": "Read job logs for the failed init_warehouse_check task to inspect detailed connection error messages and confirm the failure mode for pgdatabase."
+          }
+        ],
+        "execution_history": [],
+        "verification_history": [],
+        "reflection_history": [],
+        "llm_calls": 4,
+        "diag_calls": 2,
+        "remed_calls": 0,
+        "input_tokens": 7893,
+        "output_tokens": 463,
+        "total_tokens": 8356,
+        "latency_seconds": 21.564,
+        "judge": {
+          "root_cause_accurate": false,
+          "tool_selection_accurate": true,
+          "evidence_groundedness_score": 4,
+          "plan_correctness_score": 3,
+          "reflection_effectiveness_score": 2,
+          "justification": "The agent correctly identified the initial database connection failure (`pgdatabase` offline/unreachable) via workflow status and job logs. However, it failed to progress or uncover the cascading/subsequent failure (downstream `fetch_source_partition` HTTP 404 error) because it stopped early after diagnosing the first failure and concluded the incident was unrecoverable due to a hostname/DNS issue without exploring further execution steps."
+        }
+      },
+      "nova_full": {
+        "incident_id": "INC_KESTRA_CASCADIN_REFL_A17A",
+        "execution_id": "jfLJRNTLjMVsttowSzJJt",
+        "status": "ESCALATED",
+        "failure_type": "SERVICE_OFFLINE",
+        "implicated_resource": "pgdatabase",
+        "triage_summary": "Task 'init_warehouse_check' failed because it could not connect to PostgreSQL (pgdatabase). The database service probe confirmed `pgdatabase` is offline/unreachable (`Services: {'pgdatabase': False}`).",
+        "root_cause_hypothesis": "The PostgreSQL database service (`pgdatabase`) is currently offline, down, or inaccessible due to network issues or service stoppage, causing connection attempts from the Kestra workflow to fail.",
+        "final_summary": "Incident Escalated during replanning: The workflow failure is now caused by an external data source providing a truncated or malformed gzip file (unexpected end of file during download/decompression), which cannot be fixed by standard service restart or internal database remediation tools.",
+        "retry_count": 1,
+        "verified_recovery": false,
+        "healthy_non_intervention": false,
+        "partial_db_restarted": true,
+        "diagnostic_history": [
+          {
+            "step": 1,
+            "tool_name": "get_workflow_status",
+            "parameters": {
+              "execution_id": "jfLJRNTLjMVsttowSzJJt"
+            },
+            "output": "Workflow ID: zoomcamp_eval/04_postgres_taxi_eval_cascade\nExecution ID: jfLJRNTLjMVsttowSzJJt\nExecution State: FAILED\nInputs: {}\nTotal Task Attempts: 1\nTask States:\n  - init_warehouse_check: status=FAILED (kestra_state=FAILED, attempts=1) | Error: org.postgresql.util.PSQLException: The connection attempt failed. | The connection attempt failed.\npgdatabase\nServices: {'pgdatabase': False}",
+            "success": true,
+            "timestamp": "2026-11-26 17:36:43",
+            "rationale": "Query the Kestra execution status to identify the failed tasks, their states, and error messages for execution 'jfLJRNTLjMVsttowSzJJt'."
+          }
+        ],
+        "execution_history": [
+          {
+            "action_id": "ACT_01_01",
+            "tool_name": "restart_service",
+            "executed_at": "2026-11-26 17:37:02",
+            "exit_code": 0,
+            "stdout": "Container 'nova_taxi_pgdatabase' started and PostgreSQL is healthy.",
+            "stderr": "",
+            "duration_seconds": 2.7701,
+            "success": true,
+            "action_hash": "7e81fb5dd7bdc54c",
+            "idempotency_token": null,
+            "approved_by": "eval_operator",
+            "approver_role": "SRE_LEAD",
+            "approval_id": "APPR_INC_KESTRA_CASCADIN_REFL_A17A_ACT_01_01_7e81fb5d"
+          },
+          {
+            "action_id": "ACT_01_02",
+            "tool_name": "check_service_status",
+            "executed_at": "2026-11-26 17:37:05",
+            "exit_code": 0,
+            "stdout": "Service 'pgdatabase' status: RUNNING (Healthy: True). Detail: PostgreSQL accepting connections on 127.0.0.1:5432/ny_taxi",
+            "stderr": "",
+            "duration_seconds": 0.0163,
+            "success": true,
+            "action_hash": "27bc23a4603d61c9",
+            "idempotency_token": null,
+            "approved_by": null,
+            "approver_role": null,
+            "approval_id": null
+          },
+          {
+            "action_id": "ACT_01_03",
+            "tool_name": "resume_workflow",
+            "executed_at": "2026-11-26 17:37:06",
+            "exit_code": 1,
+            "stdout": "Kestra execution 'jfLJRNTLjMVsttowSzJJt' restarted, but ended in state FAILED on tasks ['fetch_source_partition']",
+            "stderr": "Kestra execution 'jfLJRNTLjMVsttowSzJJt' failed after restart on task(s): ['fetch_source_partition']",
+            "duration_seconds": 7.3299,
+            "success": false,
+            "action_hash": "51beb7b7db97ce5f",
+            "idempotency_token": null,
+            "approved_by": null,
+            "approver_role": null,
+            "approval_id": null
+          }
+        ],
+        "verification_history": [
+          {
+            "action_id": "ACT_01_03",
+            "verified_at": "2026-11-26 17:37:13",
+            "passed": false,
+            "evidence": "Tool execution failed with exit code 1: Kestra execution 'jfLJRNTLjMVsttowSzJJt' failed after restart on task(s): ['fetch_source_partition'] | Current failed jobs: ['fetch_source_partition (gzip: stdin: unexpected end of file | io.kestra.core.models.tasks.runners.TaskException: Command failed with exit code 1 | Command failed with exit code 1)']",
+            "details": {
+              "failed_jobs": [
+                "fetch_source_partition (gzip: stdin: unexpected end of file | io.kestra.core.models.tasks.runners.TaskException: Command failed with exit code 1 | Command failed with exit code 1)"
+              ],
+              "workflow_id": "zoomcamp_eval/04_postgres_taxi_eval_cascade"
+            }
+          }
+        ],
+        "reflection_history": [
+          {
+            "phase": "diagnostic",
+            "step": 1,
+            "evidence_sufficient": false,
+            "alternative_hypotheses": [
+              "Task failed due to external database outage",
+              "Task failed due to upstream source unavailability",
+              "Task failed due to malformed input data"
+            ],
+            "remaining_uncertainty": "We do not yet know which specific task failed or what error message was produced."
+          },
+          {
+            "phase": "diagnostic",
+            "step": 2,
+            "evidence_sufficient": true,
+            "alternative_hypotheses": [
+              "Incorrect database credentials configured in Kestra secrets",
+              "Network partition between Kestra worker and PostgreSQL"
+            ],
+            "remaining_uncertainty": null
+          },
+          {
+            "phase": "planning",
+            "retry_count": 0,
+            "addresses_root_cause": true,
+            "contradicts_prior_attempts": false,
+            "strategy_assessment": "The plan directly addresses the offline database dependency by restarting the service, verifying its health, and resuming the Kestra execution."
+          }
+        ],
+        "llm_calls": 4,
+        "diag_calls": 2,
+        "remed_calls": 2,
+        "input_tokens": 6761,
+        "output_tokens": 1325,
+        "total_tokens": 8086,
+        "latency_seconds": 50.235,
+        "judge": {
+          "root_cause_accurate": true,
+          "tool_selection_accurate": true,
+          "evidence_groundedness_score": 5,
+          "plan_correctness_score": 5,
+          "reflection_effectiveness_score": 5,
+          "justification": "The agent accurately identified the initial postgres database failure, restarted it, verified its health, resumed the workflow, and correctly identified the subsequent downstream failure on 'fetch_source_partition' (gzip EOF/external source issue), ultimately escalating appropriately as per the hidden ground truth."
+        }
+      }
+    },
+    {
+      "name": "healthy_workflow",
+      "unseen": false,
+      "expected_outcome": "ESCALATED",
+      "expected_recoverable": false,
+      "baseline": {
+        "status": "ESCALATED",
+        "healthy_non_intervention": true,
+        "verified_recovery": false,
+        "diag_calls": 1,
+        "remed_calls": 0,
+        "llm_calls": 0,
+        "total_tokens": 0,
+        "latency_seconds": 0.95,
+        "trace": [
+          {
+            "tool": "get_workflow_status",
+            "success": true
+          }
+        ]
+      },
+      "nova_no_reflection": {
+        "incident_id": "INC_KESTRA_HEALTHY__NOREFL_DAB3",
+        "execution_id": "GejFZjSrlakxD5wCg45sG",
+        "status": "ESCALATED",
+        "failure_type": null,
+        "implicated_resource": null,
+        "triage_summary": null,
+        "root_cause_hypothesis": null,
+        "final_summary": "Incident Escalated during investigation: Workflow execution GejFZjSrlakxD5wCg45sG completed successfully with all tasks in SUCCESS state. The automated alert is a false-positive and no intervention is required.",
+        "retry_count": 0,
+        "verified_recovery": false,
+        "healthy_non_intervention": true,
+        "partial_db_restarted": false,
+        "diagnostic_history": [
+          {
+            "step": 1,
+            "tool_name": "get_workflow_status",
+            "parameters": {
+              "execution_id": "GejFZjSrlakxD5wCg45sG"
+            },
+            "output": "Workflow ID: zoomcamp/04_postgres_taxi\nExecution ID: GejFZjSrlakxD5wCg45sG\nExecution State: SUCCESS\nInputs: {'taxi': 'green', 'year': '2020', 'month': '04'}\nTotal Task Attempts: 11\nTask States:\n  - set_label: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - extract: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - if_yellow_taxi: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - if_green_taxi: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - green_create_table: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - green_create_staging_table: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - green_truncate_staging_table: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - green_copy_in_to_staging_table: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - green_add_unique_id_and_filename: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - green_merge_data: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - purge_files: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\nServices: {'pgdatabase': True}",
+            "success": true,
+            "timestamp": "2026-11-26 17:37:38",
+            "rationale": "Query the Kestra workflow execution status to identify the actual task IDs, states, attempt counts, and any error messages for the active incident execution."
+          }
+        ],
+        "execution_history": [],
+        "verification_history": [],
+        "reflection_history": [],
+        "llm_calls": 2,
+        "diag_calls": 1,
+        "remed_calls": 0,
+        "input_tokens": 2735,
+        "output_tokens": 174,
+        "total_tokens": 2909,
+        "latency_seconds": 12.558,
+        "judge": {
+          "root_cause_accurate": true,
+          "tool_selection_accurate": true,
+          "evidence_groundedness_score": 5,
+          "plan_correctness_score": 5,
+          "reflection_effectiveness_score": 5,
+          "justification": "The agent correctly diagnosed that the workflow execution was entirely successful with no errors, identified the alert as a false-positive, and properly escalated/concluded that no intervention was needed based on the workflow status output."
+        }
+      },
+      "nova_full": {
+        "incident_id": "INC_KESTRA_HEALTHY__REFL_8814",
+        "execution_id": "GejFZjSrlakxD5wCg45sG",
+        "status": "ESCALATED",
+        "failure_type": null,
+        "implicated_resource": null,
+        "triage_summary": null,
+        "root_cause_hypothesis": null,
+        "final_summary": "Incident Escalated during investigation: The Kestra execution 'GejFZjSrlakxD5wCg45sG' for workflow zoomcamp/04_postgres_taxi has successfully completed (Execution State: SUCCESS, with all 11 tasks in SUCCESS state). The automated monitor alert is a false-positive or transient notification. No intervention or remediation is required.",
+        "retry_count": 0,
+        "verified_recovery": false,
+        "healthy_non_intervention": true,
+        "partial_db_restarted": false,
+        "diagnostic_history": [
+          {
+            "step": 1,
+            "tool_name": "get_workflow_status",
+            "parameters": {
+              "execution_id": "GejFZjSrlakxD5wCg45sG"
+            },
+            "output": "Workflow ID: zoomcamp/04_postgres_taxi\nExecution ID: GejFZjSrlakxD5wCg45sG\nExecution State: SUCCESS\nInputs: {'taxi': 'green', 'year': '2020', 'month': '04'}\nTotal Task Attempts: 11\nTask States:\n  - set_label: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - extract: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - if_yellow_taxi: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - if_green_taxi: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - green_create_table: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - green_create_staging_table: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - green_truncate_staging_table: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - green_copy_in_to_staging_table: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - green_add_unique_id_and_filename: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - green_merge_data: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\n  - purge_files: status=SUCCESS (kestra_state=SUCCESS, attempts=1)\nServices: {'pgdatabase': True}",
+            "success": true,
+            "timestamp": "2026-11-26 17:37:57",
+            "rationale": "Query Kestra execution status to identify active or failed tasks for execution 'GejFZjSrlakxD5wCg45sG'."
+          }
+        ],
+        "execution_history": [],
+        "verification_history": [],
+        "reflection_history": [
+          {
+            "phase": "diagnostic",
+            "step": 1,
+            "evidence_sufficient": false,
+            "alternative_hypotheses": [
+              "Workflow is currently healthy and alarm is a false positive.",
+              "Workflow has failed tasks that need log inspection."
+            ],
+            "remaining_uncertainty": "Task states and error messages are completely unknown until workflow status is retrieved."
+          }
+        ],
+        "llm_calls": 2,
+        "diag_calls": 1,
+        "remed_calls": 0,
+        "input_tokens": 3083,
+        "output_tokens": 349,
+        "total_tokens": 3432,
+        "latency_seconds": 13.534,
+        "judge": {
+          "root_cause_accurate": true,
+          "tool_selection_accurate": true,
+          "evidence_groundedness_score": 5,
+          "plan_correctness_score": 5,
+          "reflection_effectiveness_score": 5,
+          "justification": "The agent correctly selected the tool to check the workflow status, successfully retrieved the execution details showing all 11 tasks were in SUCCESS state, correctly identified the alert as a false-positive, and properly escalated/concluded that no intervention was needed, matching the ground truth."
+        }
+      }
+    }
+  ]
+}
