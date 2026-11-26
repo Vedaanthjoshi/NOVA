@@ -60,6 +60,21 @@ def _make_mock_kestra_transport(state_holder: Dict[str, Any]) -> httpx.MockTrans
                 for tr in state_holder["execution"]["taskRunList"]:
                     tr["state"]["current"] = "SUCCESS"
                     tr["attempts"].append({"state": {"current": "SUCCESS"}})
+                existing_ids = {tr["taskId"] for tr in state_holder["execution"]["taskRunList"]}
+                for downstream_tid in (
+                    "green_copy_in_to_staging_table",
+                    "green_add_unique_id_and_filename",
+                    "green_merge_data",
+                ):
+                    if downstream_tid not in existing_ids:
+                        state_holder["execution"]["taskRunList"].append(
+                            {
+                                "id": f"tr_{downstream_tid}",
+                                "taskId": downstream_tid,
+                                "state": {"current": "SUCCESS"},
+                                "attempts": [{"state": {"current": "SUCCESS"}}],
+                            }
+                        )
             else:
                 # Still failing on DB task with incremented attempt
                 for tr in state_holder["execution"]["taskRunList"]:

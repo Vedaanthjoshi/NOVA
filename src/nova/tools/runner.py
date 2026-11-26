@@ -112,6 +112,14 @@ class ToolRunner:
                 duration_seconds=round(duration, 4),
             )
 
+            res_data = dict(result.data) if isinstance(result.data, dict) else {}
+            if is_diag or not result.success:
+                env_changed = False
+            elif res_data.get("idempotent_noop") is True:
+                env_changed = False
+            else:
+                env_changed = True
+
             return ExecutionRecord(
                 action_id=action.action_id,
                 tool_name=action.tool_name,
@@ -121,6 +129,12 @@ class ToolRunner:
                 stderr=result.stderr,
                 duration_seconds=round(duration, 4),
                 success=result.success,
+                parameters=dict(action.parameters),
+                command_success=result.success,
+                environment_changed=env_changed,
+                execution_id=res_data.get("execution_id"),
+                task_attempts=res_data.get("total_attempts"),
+                details=res_data,
                 action_hash=action.action_hash,
             )
 
@@ -152,6 +166,9 @@ class ToolRunner:
                 stderr=f"Parameter Validation Error: {str(pve)}",
                 duration_seconds=round(duration, 4),
                 success=False,
+                parameters=dict(action.parameters),
+                command_success=False,
+                environment_changed=False,
                 action_hash=action.action_hash,
             )
 
@@ -183,6 +200,9 @@ class ToolRunner:
                 stderr=f"Tool Execution Exception: {str(e)}",
                 duration_seconds=round(duration, 4),
                 success=False,
+                parameters=dict(action.parameters),
+                command_success=False,
+                environment_changed=False,
                 action_hash=action.action_hash,
             )
 

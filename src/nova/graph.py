@@ -31,16 +31,18 @@ def route_after_triage(state: NovaGraphState) -> Literal["triage", "planner", "_
     return "planner"
 
 
-def route_after_planner(state: NovaGraphState) -> Literal["executor", "__end__"]:
+def route_after_planner(state: NovaGraphState) -> Literal["triage", "executor", "__end__"]:
     """
     Conditional routing after planning:
-    - ESCALATED: LLM determined failure is unrecoverable → go to END.
-    - FAILED: Planner has no strategy → go to END.
-    - Valid plan exists → go to executor.
+    - TRIAGING: Planning critique determined additional diagnostic observation is required -> triage.
+    - ESCALATED / FAILED: Unrecoverable failure or critique escalation -> go to END.
+    - Valid plan exists -> go to executor.
     """
     status = state.get("status")
     plan = state.get("plan", [])
 
+    if status == IncidentStatus.TRIAGING:
+        return "triage"
     if status in (IncidentStatus.ESCALATED, IncidentStatus.FAILED) or not plan:
         return "__end__"
     return "executor"
@@ -150,7 +152,7 @@ def build_nova_graph(
     graph_builder.add_conditional_edges(
         "planner",
         route_after_planner,
-        {"executor": "executor", "__end__": END},
+        {"triage": "triage", "executor": "executor", "__end__": END},
     )
 
     graph_builder.add_conditional_edges(

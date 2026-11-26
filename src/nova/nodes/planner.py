@@ -1,11 +1,12 @@
 import hashlib
+import inspect
 import json
 import logging
 from typing import Any, Dict, List, Optional
 from nova.llm.client import BaseLLMClient
-from nova.llm.schemas import PlannedActionSchema
+from nova.llm.schemas import PlanCritiqueResult, PlannedActionSchema, PlannerResult, TriageResult
 from nova.observability import incident_context, log_event, redact_secrets, telemetry
-from nova.state import IncidentStatus, NovaGraphState, PlannedAction, RiskLevel
+from nova.state import IncidentStatus, NovaGraphState, PlannedAction, RiskLevel, build_prior_attempts
 from nova.tools.runner import ToolRunner
 
 logger = logging.getLogger("nova.nodes.planner")
@@ -96,6 +97,129 @@ def _schema_to_domain(
     )
 
 
+def _validate_structural_actions(
+    actions: List[PlannedActionSchema],
+    runner: Optional[ToolRunner],
+    triage: TriageResult,
+) -> List[str]:
+    """Deterministic recoverability boundary check (safe across both ablation arms)."""
+    errors: List[str] = []
+    if triage.is_recoverable is False and actions:
+        errors.append(
+            f"Plan proposed {len(actions)} action(s) despite diagnosis marking is_recoverable=False."
+        )
+    return errors
+
+
+def _evaluate_plan_semantics(
+    actions: List[PlannedActionSchema],
+    env: Optional[Any],
+    triage: TriageResult,
+    state: NovaGraphState,
+    runner: Optional[ToolRunner] = None,
+) -> List[str]:
+    """
+    Planning critique checks validating that proposed tools and arguments are
+    available in the live registry, schema-valid, compatible with environment
+    capabilities, and consistent with prior attempts and observed evidence.
+    """
+    issues: List[str] = []
+    exec_history = state.get("execution_history") or []
+    evidence_text = " ".join(triage.investigation_evidence or []).lower()
+
+    for idx, act in enumerate(actions, start=1):
+        if runner is not None:
+            if not runner.is_tool_allowed(act.tool_name):
+                issues.append(f"Step {idx}: tool '{act.tool_name}' is not in the active ToolRunner registry.")
+                continue
+            try:
+                tool = runner.get_tool(act.tool_name)
+                tool.args_schema.model_validate(act.parameters)
+            except Exception as exc:
+                issues.append(f"Step {idx}: invalid parameters for '{act.tool_name}': {exc}")
+
+        if act.tool_name == "restart_service" and env is not None:
+            svc = act.parameters.get("service_name", "")
+            if hasattr(env, "is_registered_service") and not env.is_registered_service(svc):
+                issues.append(f"Step {idx}: service '{svc}' is not a registered dependency.")
+            elif hasattr(env, "is_restartable_service") and not env.is_restartable_service(svc):
+                issues.append(f"Step {idx}: service '{svc}' cannot be restarted by NOVA.")
+
+        if act.tool_name == "clear_lockfile" and env is not None and hasattr(env, "is_lock_active"):
+            lock_name = act.parameters.get("lock_name", "")
+            if lock_name and env.is_lock_active(lock_name):
+                issues.append(f"Step {idx}: lockfile '{lock_name}' belongs to an active worker.")
+
+        if act.tool_name == "resume_workflow" and triage.workflow_run_id and env is not None and hasattr(env, "bind_execution"):
+            req_eid = act.parameters.get("execution_id")
+            if req_eid and req_eid != triage.workflow_run_id:
+                issues.append(
+                    f"Step {idx}: resume_workflow execution_id '{req_eid}' does not match bound '{triage.workflow_run_id}'."
+                )
+
+    # Check if the plan repeats an action that failed in the most recent cycle with no intervening env change
+    if exec_history:
+        last_rec = exec_history[-1]
+        last_dict = last_rec.model_dump() if hasattr(last_rec, "model_dump") else dict(last_rec)
+        if not last_dict.get("success", True):
+            last_tool = last_dict.get("tool_name")
+            last_params = json.dumps(last_dict.get("parameters") or {}, sort_keys=True)
+            for act in actions:
+                act_params = json.dumps(act.parameters or {}, sort_keys=True)
+                if act.tool_name == last_tool and act_params == last_params and len(actions) == 1:
+                    issues.append(
+                        f"Plan repeats failed action '{act.tool_name}' with identical parameters without addressing prior failure."
+                    )
+
+    # Check if a bare resume_workflow is proposed when a restartable dependency is confirmed offline
+    if len(actions) == 1 and actions[0].tool_name == "resume_workflow":
+        implicated = triage.implicated_resource or ""
+        is_restartable_target = bool(
+            env is not None
+            and implicated
+            and (
+                (hasattr(env, "is_restartable_service") and env.is_restartable_service(implicated))
+                or (
+                    not hasattr(env, "is_restartable_service")
+                    and hasattr(env, "is_registered_service")
+                    and env.is_registered_service(implicated)
+                )
+            )
+        )
+        if (triage.failure_type == "SERVICE_OFFLINE" and is_restartable_target) or (
+            "healthy: false" in evidence_text and ("pgdatabase" in evidence_text or "reporting_warehouse_service" in evidence_text)
+        ):
+            issues.append(
+                "Plan proposes bare workflow restart without first restarting confirmed offline dependency."
+            )
+
+    return issues
+
+
+def _call_critique_plan(
+    llm: BaseLLMClient,
+    triage: TriageResult,
+    proposed_actions: List[Dict[str, Any]],
+    available_tools: List[Dict[str, Any]],
+    retry_count: int,
+) -> Optional[PlanCritiqueResult]:
+    critique_fn = getattr(llm, "critique_plan", None)
+    if critique_fn is None:
+        return None
+    sig = inspect.signature(critique_fn)
+    kwargs: Dict[str, Any] = {
+        "triage": triage,
+        "proposed_actions": proposed_actions,
+        "available_tools": available_tools,
+        "retry_count": retry_count,
+    }
+    filtered = {
+        k: v for k, v in kwargs.items()
+        if k in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    }
+    return critique_fn(**filtered)
+
+
 def create_planner_node(
     llm: BaseLLMClient,
     env: Optional[Any] = None,
@@ -110,8 +234,6 @@ def create_planner_node(
             hypothesis = state.get("root_cause_hypothesis", "")
             retry_count = state.get("retry_count", 0)
             action_seq = retry_count + 1
-
-            from nova.llm.schemas import TriageResult
 
             failure_type = state.get("failure_type") or _infer_failure_type(triage_summary, hypothesis)
             implicated_resource = state.get("implicated_resource") or _extract_implicated_resource(triage_summary)
@@ -134,31 +256,9 @@ def create_planner_node(
                     active_workflow_id = getattr(wf_state, "workflow_id", None)
                     bound_run_id = bound_run_id or getattr(wf_state, "run_id", None)
 
-            # Build structured prior-attempt history so planner sees failed tools/postconditions
-            prior_attempts: List[Dict[str, Any]] = []
-            for rec in state.get("execution_history", []):
-                rec_dict = rec.model_dump() if hasattr(rec, "model_dump") else dict(rec)
-                prior_attempts.append(
-                    {
-                        "kind": "execution",
-                        "action_id": rec_dict.get("action_id"),
-                        "tool_name": rec_dict.get("tool_name"),
-                        "success": rec_dict.get("success"),
-                        "exit_code": rec_dict.get("exit_code"),
-                        "stderr": (rec_dict.get("stderr") or "")[:400],
-                    }
-                )
-            for vrec in state.get("verification_history", []):
-                v_dict = vrec.model_dump() if hasattr(vrec, "model_dump") else dict(vrec)
-                prior_attempts.append(
-                    {
-                        "kind": "verification",
-                        "action_id": v_dict.get("action_id"),
-                        "passed": v_dict.get("passed"),
-                        "evidence": (v_dict.get("evidence") or "")[:400],
-                        "details": v_dict.get("details") or {},
-                    }
-                )
+            # Build complete, non-lossy prior-attempt history so planner sees parameters, outputs,
+            # command vs. postcondition status, environment changes, and execution/attempt IDs.
+            prior_attempts = build_prior_attempts(state)
 
             strategy_notes = None
             for refl in reversed(state.get("reflection_history", [])):
@@ -245,6 +345,256 @@ def create_planner_node(
                     "final_summary": reason,
                 }
 
+            initial_plan_dump = [a.model_dump() for a in planner_result.actions]
+            reflection_entries: List[Dict[str, Any]] = []
+            plan_revision_entries: List[Dict[str, Any]] = []
+            critique_enabled = bool(getattr(llm, "enable_reflection", False))
+            if planner_result.reflection is not None:
+                reflection_entries.append(
+                    {"phase": "planning", "retry_count": retry_count, **planner_result.reflection.model_dump()}
+                )
+
+            structural_errors = _validate_structural_actions(planner_result.actions, runner, proxy_triage)
+            semantic_errors = (
+                _evaluate_plan_semantics(planner_result.actions, env, proxy_triage, state, runner=runner)
+                if critique_enabled
+                else []
+            )
+
+            critique_res: Optional[PlanCritiqueResult] = None
+            if critique_enabled:
+                try:
+                    critique_res = _call_critique_plan(
+                        llm=llm,
+                        triage=proxy_triage,
+                        proposed_actions=initial_plan_dump,
+                        available_tools=available_tools,
+                        retry_count=retry_count,
+                    )
+                except Exception as critique_exc:
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "planner_critique_error",
+                        f"Planning critique failed softly: {redact_secrets(str(critique_exc))}",
+                    )
+
+            refl_obj = planner_result.reflection
+            refl_rejected = bool(
+                critique_enabled
+                and refl_obj is not None
+                and (
+                    not refl_obj.addresses_root_cause
+                    or refl_obj.contradicts_prior_attempts
+                    or refl_obj.requires_revision
+                    or refl_obj.requires_further_investigation
+                    or refl_obj.should_escalate
+                )
+            )
+            critique_rejected = bool(
+                critique_res is not None
+                and (
+                    not critique_res.approved
+                    or not critique_res.addresses_root_cause
+                    or critique_res.contradicts_prior_attempts
+                    or not critique_res.tools_valid_and_appropriate
+                    or critique_res.requires_further_investigation
+                    or critique_res.should_escalate
+                )
+            )
+
+            needs_critique_action = bool(structural_errors or semantic_errors or refl_rejected or critique_rejected)
+
+            if needs_critique_action:
+                critique_reasons: List[str] = list(structural_errors) + list(semantic_errors)
+                if refl_rejected and refl_obj is not None:
+                    critique_reasons.append(
+                        refl_obj.critique_notes
+                        or refl_obj.strategy_assessment
+                        or "Planning reflection flagged misalignment with root cause or prior attempts."
+                    )
+                if critique_res is not None and critique_rejected:
+                    critique_reasons.append(critique_res.critique_summary)
+                    if critique_res.recommended_adjustment:
+                        critique_reasons.append(f"Recommended adjustment: {critique_res.recommended_adjustment}")
+
+                critique_summary = " | ".join(r for r in critique_reasons if r)
+                critique_record: Dict[str, Any] = {
+                    "phase": "planning_critique",
+                    "retry_count": retry_count,
+                    "approved": False,
+                    "structural_errors": structural_errors,
+                    "semantic_errors": semantic_errors,
+                    "critique_summary": critique_summary,
+                }
+                if critique_res is not None:
+                    critique_record["model_critique"] = critique_res.model_dump()
+                reflection_entries.append(critique_record)
+
+                want_reinvestigate = bool(
+                    (critique_res and critique_res.requires_further_investigation)
+                    or (refl_obj and refl_obj.requires_further_investigation)
+                )
+                want_escalate = bool(
+                    (critique_res and critique_res.should_escalate)
+                    or (refl_obj and refl_obj.should_escalate)
+                    or (proxy_triage.is_recoverable is False)
+                )
+
+                # Route back to triage if critique determines more diagnostic observation is needed
+                if want_reinvestigate and state.get("investigation_steps", 0) < state.get("max_investigation_steps", 5):
+                    plan_revision_entries.append(
+                        {
+                            "retry_count": retry_count,
+                            "initial_plan": initial_plan_dump,
+                            "critique": critique_summary,
+                            "final_plan": [],
+                            "outcome": "REINVESTIGATE",
+                        }
+                    )
+                    log_event(logger, logging.INFO, "planner_critique_reinvestigate", critique_summary)
+                    return {
+                        "plan": [],
+                        "current_action_index": 0,
+                        "status": IncidentStatus.TRIAGING,
+                        "investigation_evidence": [f"[Planning Critique] {critique_summary}"],
+                        "reflection_history": reflection_entries,
+                        "plan_revisions": plan_revision_entries,
+                    }
+
+                if want_escalate or not critique_enabled:
+                    reason = f"Incident Escalated after planning validation/critique: {critique_summary}"
+                    telemetry.record_terminal_reason(incident_id, "ESCALATED", reason)
+                    plan_revision_entries.append(
+                        {
+                            "retry_count": retry_count,
+                            "initial_plan": initial_plan_dump,
+                            "critique": critique_summary,
+                            "final_plan": [],
+                            "outcome": "ESCALATED",
+                        }
+                    )
+                    log_event(logger, logging.WARNING, "planner_critique_escalated", reason)
+                    return {
+                        "plan": [],
+                        "current_action_index": 0,
+                        "status": IncidentStatus.ESCALATED,
+                        "final_summary": reason,
+                        "reflection_history": reflection_entries,
+                        "plan_revisions": plan_revision_entries,
+                    }
+
+                # Attempt one bounded revision using explicit critique feedback
+                revised_triage = proxy_triage.model_copy(update={"critique_feedback": critique_summary})
+                try:
+                    revised_result = llm.plan(
+                        triage=revised_triage,
+                        available_tools=available_tools,
+                        retry_count=retry_count,
+                    )
+                except Exception as rev_exc:
+                    reason = f"Incident Escalated: Plan critique rejected initial plan ({critique_summary}), and revision failed: {redact_secrets(str(rev_exc))}"
+                    telemetry.record_terminal_reason(incident_id, "ESCALATED", reason)
+                    plan_revision_entries.append(
+                        {
+                            "retry_count": retry_count,
+                            "initial_plan": initial_plan_dump,
+                            "critique": critique_summary,
+                            "final_plan": [],
+                            "outcome": "ESCALATED",
+                        }
+                    )
+                    return {
+                        "plan": [],
+                        "current_action_index": 0,
+                        "status": IncidentStatus.ESCALATED,
+                        "final_summary": reason,
+                        "reflection_history": reflection_entries,
+                        "plan_revisions": plan_revision_entries,
+                    }
+
+                if revised_result.reflection is not None:
+                    reflection_entries.append(
+                        {
+                            "phase": "planning_revised",
+                            "retry_count": retry_count,
+                            **revised_result.reflection.model_dump(),
+                        }
+                    )
+
+                if revised_result.is_escalation:
+                    reason = (
+                        f"Incident Escalated after planning critique: "
+                        f"{revised_result.escalation_reason or critique_summary}"
+                    )
+                    telemetry.record_terminal_reason(incident_id, "ESCALATED", reason)
+                    plan_revision_entries.append(
+                        {
+                            "retry_count": retry_count,
+                            "initial_plan": initial_plan_dump,
+                            "critique": critique_summary,
+                            "final_plan": [],
+                            "outcome": "ESCALATED",
+                        }
+                    )
+                    log_event(logger, logging.WARNING, "planner_revised_to_escalation", reason)
+                    return {
+                        "plan": [],
+                        "current_action_index": 0,
+                        "status": IncidentStatus.ESCALATED,
+                        "final_summary": reason,
+                        "reflection_history": reflection_entries,
+                        "plan_revisions": plan_revision_entries,
+                    }
+
+                rev_struct_err = _validate_structural_actions(revised_result.actions, runner, proxy_triage)
+                rev_sem_err = _evaluate_plan_semantics(revised_result.actions, env, proxy_triage, state, runner=runner)
+                if not revised_result.actions or rev_struct_err or rev_sem_err:
+                    combined = " | ".join(rev_struct_err + rev_sem_err) or "Revised plan was empty."
+                    reason = (
+                        f"Incident Escalated: Revised plan failed validation after critique "
+                        f"({combined}). Initial critique: {critique_summary}"
+                    )
+                    telemetry.record_terminal_reason(incident_id, "ESCALATED", reason)
+                    plan_revision_entries.append(
+                        {
+                            "retry_count": retry_count,
+                            "initial_plan": initial_plan_dump,
+                            "critique": critique_summary,
+                            "final_plan": [a.model_dump() for a in revised_result.actions],
+                            "outcome": "ESCALATED",
+                        }
+                    )
+                    log_event(logger, logging.WARNING, "planner_revised_plan_invalid", reason)
+                    return {
+                        "plan": [],
+                        "current_action_index": 0,
+                        "status": IncidentStatus.ESCALATED,
+                        "final_summary": reason,
+                        "reflection_history": reflection_entries,
+                        "plan_revisions": plan_revision_entries,
+                    }
+
+                planner_result = revised_result
+                plan_revision_entries.append(
+                    {
+                        "retry_count": retry_count,
+                        "initial_plan": initial_plan_dump,
+                        "critique": critique_summary,
+                        "final_plan": [a.model_dump() for a in planner_result.actions],
+                        "outcome": "REVISED",
+                    }
+                )
+            elif critique_res is not None:
+                reflection_entries.append(
+                    {
+                        "phase": "planning_critique",
+                        "retry_count": retry_count,
+                        "approved": True,
+                        "model_critique": critique_res.model_dump(),
+                    }
+                )
+
             plan = [
                 _schema_to_domain(
                     action_schema,
@@ -269,10 +619,10 @@ def create_planner_node(
                 "current_action_index": 0,
                 "status": IncidentStatus.EXECUTING,
             }
-            if planner_result.reflection is not None:
-                out_plan["reflection_history"] = [
-                    {"phase": "planning", "retry_count": retry_count, **planner_result.reflection.model_dump()}
-                ]
+            if reflection_entries:
+                out_plan["reflection_history"] = reflection_entries
+            if plan_revision_entries:
+                out_plan["plan_revisions"] = plan_revision_entries
             return out_plan
 
     return planner_node

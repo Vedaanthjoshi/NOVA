@@ -300,15 +300,26 @@ elif view_mode == "🚨 Incident Trigger & Fault Injection":
             with col_s:
                 custom_steps = st.number_input("Max Investigation Steps", min_value=1, max_value=10, value=5)
 
+            col_env, col_eid = st.columns(2)
+            with col_env:
+                custom_env = st.selectbox("Execution Backend", ["mock", "kestra"], index=0)
+            with col_eid:
+                custom_eid = st.text_input("Kestra Execution ID (if kestra)", value="")
+
             submitted = st.form_submit_button("Submit Incident to NOVA", use_container_width=True)
             if submitted:
                 try:
-                    res = api.trigger_incident(
-                        raw_symptoms=custom_symptoms,
-                        target_service=custom_target,
-                        max_retries=custom_retries,
-                        max_investigation_steps=custom_steps,
-                    )
+                    trigger_kwargs: Dict[str, Any] = {
+                        "raw_symptoms": custom_symptoms,
+                        "target_service": custom_target,
+                        "max_retries": custom_retries,
+                        "max_investigation_steps": custom_steps,
+                    }
+                    if custom_env == "kestra" or custom_eid.strip():
+                        trigger_kwargs["environment"] = custom_env
+                        if custom_eid.strip():
+                            trigger_kwargs["execution_id"] = custom_eid.strip()
+                    res = api.trigger_incident(**trigger_kwargs)
                     st.session_state.selected_incident_id = res["incident_id"]
                     st.success(f"Incident `{res['incident_id']}` accepted by Gateway!")
                 except Exception as e:

@@ -27,6 +27,7 @@ from nova.llm.schemas import (
     DiagnosticToolCall,
     InvestigationActionType,
     InvestigationDecision,
+    PlanCritiqueResult,
     PlannedActionSchema,
     PlannerResult,
     ReplannerResult,
@@ -62,6 +63,8 @@ class BaseLLMClient(ABC):
         diagnostic_history: List[Dict[str, Any]],
         available_tools: List[Dict[str, Any]],
         step_number: int,
+        prior_attempts: Optional[List[Dict[str, Any]]] = None,
+        current_diagnosis: Optional[Dict[str, Any]] = None,
     ) -> InvestigationDecision:
         """
         Inspect gathered diagnostic evidence and decide next action:
@@ -89,6 +92,22 @@ class BaseLLMClient(ABC):
         Return structured actions or an escalation decision.
         """
 
+    def critique_plan(
+        self,
+        triage: TriageResult,
+        proposed_actions: List[Dict[str, Any]],
+        available_tools: List[Dict[str, Any]],
+        retry_count: int,
+    ) -> PlanCritiqueResult:
+        """
+        Optional planning critique step verifying proposed actions against root cause,
+        prior unsuccessful attempts, and tool capabilities.
+        """
+        return PlanCritiqueResult(
+            approved=True,
+            critique_summary="No critique step configured for this client.",
+        )
+
     @abstractmethod
     def replan(
         self,
@@ -102,6 +121,7 @@ class BaseLLMClient(ABC):
         verification_records: Optional[List[Dict[str, Any]]] = None,
         investigation_evidence: Optional[List[str]] = None,
         original_diagnosis: Optional[Dict[str, Any]] = None,
+        attempted_plan: Optional[List[Dict[str, Any]]] = None,
     ) -> ReplannerResult:
         """
         Evidence-based replanning after execution / verification feedback.
@@ -126,6 +146,9 @@ class MockLLMClient(BaseLLMClient):
     The only thing that changes in production is the client implementation.
     """
 
+    def __init__(self, enable_reflection: bool = False):
+        self.enable_reflection = enable_reflection
+
     def investigate(
         self,
         target_service: Optional[str],
@@ -134,6 +157,8 @@ class MockLLMClient(BaseLLMClient):
         diagnostic_history: List[Dict[str, Any]],
         available_tools: List[Dict[str, Any]],
         step_number: int,
+        prior_attempts: Optional[List[Dict[str, Any]]] = None,
+        current_diagnosis: Optional[Dict[str, Any]] = None,
     ) -> InvestigationDecision:
         """
         Autonomous investigation agent simulation:
@@ -448,6 +473,46 @@ class MockLLMClient(BaseLLMClient):
         )
         return result
 
+    def critique_plan(
+        self,
+        triage: TriageResult,
+        proposed_actions: List[Dict[str, Any]],
+        available_tools: List[Dict[str, Any]],
+        retry_count: int,
+    ) -> PlanCritiqueResult:
+        """Deterministic planning critique for MockLLMClient when enable_reflection=True."""
+        if not self.enable_reflection:
+            return PlanCritiqueResult(
+                approved=True,
+                critique_summary="Explicit planning critique disabled.",
+            )
+        tool_names = {t.get("name") for t in available_tools}
+        issues: List[str] = []
+        for act in proposed_actions:
+            tname = act.get("tool_name")
+            if tname not in tool_names:
+                issues.append(f"Tool '{tname}' is not in registered tools.")
+        if not triage.is_recoverable and proposed_actions:
+            issues.append("Proposed remediation actions when diagnosis indicates unrecoverable failure.")
+        if len(proposed_actions) == 1 and proposed_actions[0].get("tool_name") == "resume_workflow":
+            if triage.failure_type == "SERVICE_OFFLINE":
+                issues.append(
+                    f"Proposed bare resume_workflow without restarting confirmed offline service '{triage.implicated_resource}'."
+                )
+        if issues:
+            return PlanCritiqueResult(
+                approved=False,
+                addresses_root_cause=False,
+                tools_valid_and_appropriate=False,
+                should_escalate=not triage.is_recoverable,
+                critique_summary=" | ".join(issues),
+                recommended_adjustment="Revise plan to directly remediate the confirmed root cause or escalate.",
+            )
+        return PlanCritiqueResult(
+            approved=True,
+            critique_summary="Plan aligns with diagnosed root cause, available tools, and prior attempts.",
+        )
+
     def _plan_impl(
         self,
         triage: TriageResult,
@@ -577,6 +642,7 @@ class MockLLMClient(BaseLLMClient):
         verification_records: Optional[List[Dict[str, Any]]] = None,
         investigation_evidence: Optional[List[str]] = None,
         original_diagnosis: Optional[Dict[str, Any]] = None,
+        attempted_plan: Optional[List[Dict[str, Any]]] = None,
     ) -> ReplannerResult:
         """
         Evidence-based replanning. Does NOT assume previous remediation succeeded.
@@ -911,25 +977,59 @@ class GeminiLLMClient(BaseLLMClient):
             parsed = json.loads(raw_text)
             validated = schema.model_validate(parsed)
         except (json.JSONDecodeError, Exception) as e:
-            dt = time.perf_counter() - t_total
-            safe_err = redact_secrets(str(e))
-            telemetry.record_llm_call(
-                incident_id=None,
-                operation=operation,
-                model_name=self._model_name,
-                duration_seconds=dt,
-                retries=retries_used,
-                rate_limits=rate_limits_hit,
-                success=False,
-                error=f"Invalid JSON/schema for {schema.__name__}: {safe_err}",
-                input_tokens=in_tokens,
-                output_tokens=out_tokens,
-                total_tokens=total_tokens,
-            )
-            raise ValueError(
-                f"LLM returned invalid JSON for schema {schema.__name__}. "
-                f"Raw response: {raw_text!r}. Error: {e}"
-            ) from e
+            # One bounded self-repair retry when Gemini returns slightly malformed JSON (e.g. comments)
+            retry_ok = False
+            try:
+                repair_prompt = (
+                    f"{user_prompt}\n\n"
+                    f"IMPORTANT: Your previous response was not valid JSON for {schema.__name__} ({e}). "
+                    "Return ONLY strict RFC-8259 JSON with double-quoted keys and NO comments."
+                )
+                model = self._genai.GenerativeModel(
+                    model_name=self._model_name,
+                    system_instruction=system_prompt,
+                    generation_config=self._genai.GenerationConfig(
+                        response_mime_type="application/json",
+                        temperature=0.0,
+                    ),
+                )
+                resp2 = model.generate_content(repair_prompt)
+                i2, o2, t2 = self._extract_token_usage(resp2)
+                in_tokens += i2
+                out_tokens += o2
+                total_tokens += t2
+                raw2 = (getattr(resp2, "text", None) or "").strip()
+                if raw2.startswith("```"):
+                    raw2 = re.sub(r"^```(?:json)?\n?", "", raw2)
+                    raw2 = re.sub(r"\n?```$", "", raw2)
+                parsed = json.loads(raw2)
+                validated = schema.model_validate(parsed)
+                retry_ok = True
+                retries_used += 1
+            except Exception as retry_exc:
+                e = retry_exc
+                raw_text = locals().get("raw2", raw_text)
+
+            if not retry_ok:
+                dt = time.perf_counter() - t_total
+                safe_err = redact_secrets(str(e))
+                telemetry.record_llm_call(
+                    incident_id=None,
+                    operation=operation,
+                    model_name=self._model_name,
+                    duration_seconds=dt,
+                    retries=retries_used,
+                    rate_limits=rate_limits_hit,
+                    success=False,
+                    error=f"Invalid JSON/schema for {schema.__name__}: {safe_err}",
+                    input_tokens=in_tokens,
+                    output_tokens=out_tokens,
+                    total_tokens=total_tokens,
+                )
+                raise ValueError(
+                    f"LLM returned invalid JSON for schema {schema.__name__}. "
+                    f"Raw response: {raw_text!r}. Error: {e}"
+                ) from e
 
         dt = time.perf_counter() - t_total
         telemetry.record_llm_call(
@@ -968,21 +1068,41 @@ class GeminiLLMClient(BaseLLMClient):
         diagnostic_history: List[Dict[str, Any]],
         available_tools: List[Dict[str, Any]],
         step_number: int,
+        prior_attempts: Optional[List[Dict[str, Any]]] = None,
+        current_diagnosis: Optional[Dict[str, Any]] = None,
+        remediation_capabilities: Optional[List[Dict[str, Any]]] = None,
     ) -> InvestigationDecision:
         tools_text = self._format_tools(available_tools)
+        remed_caps_text = (
+            self._format_tools(remediation_capabilities)
+            if remediation_capabilities
+            else "Unknown (assess recoverability conservatively)."
+        )
         reflection_schema = (
             """,
   "reflection": {
     "evidence_sufficient": boolean,
+    "supporting_observations": [string],
+    "contradicting_observations": [string],
     "alternative_hypotheses": [string],
-    "remaining_uncertainty": string | null
+    "remaining_uncertainty": string | null,
+    "recommended_diagnostic_tool": {
+      "tool_name": string,
+      "parameters": {},
+      "rationale": string
+    } | null
   }"""
             if self.enable_reflection
             else ""
         )
         reflection_rules = (
             """
-- Before choosing DIAGNOSIS_READY, perform diagnostic reflection: verify evidence_sufficient=true against actual logs/status outputs, list plausible alternative hypotheses considered, and if genuine uncertainty remains, choose DIAGNOSTIC_ACTION to gather missing evidence."""
+- Perform diagnostic reflection on every step:
+  - Cite specific collected observations in `supporting_observations` and any conflicting findings in `contradicting_observations`.
+  - List plausible alternative explanations in `alternative_hypotheses` when evidence is ambiguous.
+  - Set `evidence_sufficient=true` ONLY if gathered observations conclusively support the diagnosis and rule out competing hypotheses.
+  - If `evidence_sufficient=false`, provide `recommended_diagnostic_tool` (or choose `DIAGNOSTIC_ACTION`) requesting a specific observation that distinguishes between competing hypotheses.
+  - If new evidence contradicts `Current Diagnosis` or `Prior Attempts`, revise the diagnosis accordingly."""
             if self.enable_reflection
             else ""
         )
@@ -990,8 +1110,11 @@ class GeminiLLMClient(BaseLLMClient):
         system_prompt = f"""You are an expert SRE investigator diagnosing an enterprise batch workflow incident.
 Your goal is to gather empirical evidence using ONLY the registered read-only diagnostic tools below before concluding a diagnosis or escalating.
 
-Available READ-ONLY Diagnostic Tools (discovered dynamically from registry):
+Available READ-ONLY Diagnostic Tools (discovered dynamically from registry — ONLY these tools may be called during investigation):
 {tools_text}
+
+Downstream Remediation Capabilities (for judging `is_recoverable` ONLY — NEVER request these during investigation):
+{remed_caps_text}
 
 Output MUST be valid JSON matching EXACTLY one of these decisions:
 
@@ -1009,7 +1132,7 @@ Output MUST be valid JSON matching EXACTLY one of these decisions:
 {{
   "decision_type": "DIAGNOSIS_READY",
   "diagnosis": {{
-    "failure_type": "SERVICE_OFFLINE" | "DATA_CORRUPTION" | "SOURCE_UNAVAILABLE" | "MALFORMED_INPUT" | "STALE_LOCKFILE" | "DEPENDENCY_FAILURE" | "UNKNOWN",
+    "failure_type": "SERVICE_OFFLINE" | "TRANSIENT" | "DATA_CORRUPTION" | "SOURCE_UNAVAILABLE" | "MALFORMED_INPUT" | "STALE_LOCKFILE" | "DEPENDENCY_FAILURE" | "UNKNOWN",
     "implicated_resource": string,
     "triage_summary": string,
     "root_cause_hypothesis": string,
@@ -1026,19 +1149,25 @@ Output MUST be valid JSON matching EXACTLY one of these decisions:
 
 Rules:
 - NEVER invent tool names or parameters not listed in Available READ-ONLY Diagnostic Tools above.
-- Start with `get_workflow_status` if execution/task status has not yet been observed.
+- Start with `get_workflow_status` if execution/task status has not yet been observed (or re-check it if prior remediation/retry changed execution state).
 - Inspect the failed task's logs (`read_job_logs`) and relevant service health (`check_service_status`) before concluding root cause.
+- Never blindly trust noisy warnings or initial symptom hints when direct status/log probes contradict them — verify with `check_service_status` or `read_job_logs`.
 - If workflow status shows all tasks SUCCESS (healthy workflow, no failed tasks), return ESCALATE indicating a healthy workflow / false-positive alert with no intervention needed.
 - If lockfiles show STATUS=ACTIVE_WORKER or recent live heartbeat, return ESCALATE (never delete active locks).
-- Do NOT mark external source outages (e.g. HTTP 404/upstream release unreachable), malformed CSV/input schema errors, or checksum data corruption as recoverable unless a registered remediation tool can actually fix them.
-- Do NOT repeat identical diagnostic tool calls with identical parameters.{reflection_rules}
+- Do NOT mark external source outages (e.g. HTTP 404/upstream release unreachable), malformed CSV/JSON/input schema errors, missing Python/DuckDB/SQL defects, or checksum data corruption as recoverable unless a registered remediation tool can actually fix them.
+- Do NOT repeat identical diagnostic tool calls unless a prior remediation/retry changed the environment since that call.{reflection_rules}
 """
         evidence_text = "\n".join(f"- {ev}" for ev in investigation_evidence) if investigation_evidence else "None yet."
         history_text = json.dumps(diagnostic_history, indent=2) if diagnostic_history else "No diagnostic tools run yet."
+        prior_text = json.dumps(prior_attempts or [], indent=2) if prior_attempts else "None yet."
+        cur_diag_text = json.dumps(current_diagnosis, indent=2) if current_diagnosis else "None yet."
 
         user_prompt = f"""Current Investigation State (Step {step_number}):
 Target Service / Task: {target_service or 'UNKNOWN'}
 Raw Symptoms: {raw_symptoms}
+
+Current Working Diagnosis (if reinvestigating):
+{cur_diag_text}
 
 Accumulated Evidence:
 {evidence_text}
@@ -1046,9 +1175,15 @@ Accumulated Evidence:
 Diagnostic History:
 {history_text}
 
+Prior Remediation / Verification Attempts:
+{prior_text}
+
 Determine the next investigation decision as JSON."""
 
-        return self._call(system_prompt, user_prompt, InvestigationDecision, operation="investigate")
+        res = self._call(system_prompt, user_prompt, InvestigationDecision, operation="investigate")
+        if not self.enable_reflection and res.reflection is not None:
+            res = res.model_copy(update={"reflection": None})
+        return res
 
     def triage(self, target_service: str, log_content: str) -> TriageResult:
         system_prompt = f"""You are an expert SRE (Site Reliability Engineer) specializing in batch job incident diagnosis.
@@ -1091,6 +1226,10 @@ Analyze and return JSON diagnosis."""
   "reflection": {
     "addresses_root_cause": boolean,
     "contradicts_prior_attempts": boolean,
+    "requires_revision": boolean,
+    "requires_further_investigation": boolean,
+    "should_escalate": boolean,
+    "critique_notes": string | null,
     "strategy_assessment": string
   }"""
             if self.enable_reflection
@@ -1127,15 +1266,20 @@ Output MUST be valid JSON:
 
 Rules:
 - You MUST ONLY choose tools listed in Available Tools above. Never reference unregistered tools.
-- If no registered tool can resolve the diagnosed failure (e.g. external source unavailable, malformed CSV/input, data corruption, non-restartable dependency), set is_escalation=true, actions=[], and explain why in escalation_reason.
+- If no registered tool can resolve the diagnosed failure (e.g. external source unavailable, malformed CSV/JSON/input, data corruption, non-restartable dependency), set is_escalation=true, actions=[], and explain why in escalation_reason.
 - If is_escalation=true, actions MUST be empty and escalation_reason MUST be non-empty.
 - If is_escalation=false, escalation_reason MUST be null and actions MUST be non-empty.
 - parameters MUST use the exact parameter keys documented for each tool and values derived strictly from context (never invent IDs or names).
 - After any mutating remediation action that fixes an underlying blocker, include `resume_workflow` as the final action using the exact active execution/workflow parameter required by `resume_workflow` in Available Tools above (the verifier is strictly read-only and will not run the workflow itself).
-- Inspect Prior Attempts carefully: this is retry cycle {retry_count + 1}. Do not repeat actions/strategies that already failed.{reflection_rules}
+- Inspect Prior Attempts carefully: this is retry cycle {retry_count + 1}. Check command_success, postcondition_passed, postcondition_error, and environment_changed. Do not repeat actions/strategies that already failed.{reflection_rules}
 """
         prior_json = json.dumps(triage.prior_attempts or [], indent=2)
         evidence_text = "\n".join(f"- {ev}" for ev in (triage.investigation_evidence or [])) or "None."
+        critique_section = (
+            f"\nMandatory Critique Feedback (revise or escalate to address this):\n{triage.critique_feedback}\n"
+            if triage.critique_feedback
+            else ""
+        )
         user_prompt = f"""Triage Result:
 - workflow_id: {triage.workflow_id or 'UNKNOWN'}
 - workflow_run_id / execution_id: {triage.workflow_run_id or 'UNKNOWN'}
@@ -1145,7 +1289,7 @@ Rules:
 - root_cause_hypothesis: {triage.root_cause_hypothesis}
 - is_recoverable: {triage.is_recoverable}
 - replanner_strategy_notes: {triage.strategy_notes or 'None'}
-
+{critique_section}
 Investigation Evidence:
 {evidence_text}
 
@@ -1154,7 +1298,58 @@ Prior Attempted Actions & Verification Outcomes:
 
 Produce the remediation plan as JSON."""
 
-        return self._call(system_prompt, user_prompt, PlannerResult, operation="plan")
+        res = self._call(system_prompt, user_prompt, PlannerResult, operation="plan")
+        if not self.enable_reflection and res.reflection is not None:
+            res = res.model_copy(update={"reflection": None})
+        return res
+
+    def critique_plan(
+        self,
+        triage: TriageResult,
+        proposed_actions: List[Dict[str, Any]],
+        available_tools: List[Dict[str, Any]],
+        retry_count: int,
+    ) -> PlanCritiqueResult:
+        if not self.enable_reflection:
+            return PlanCritiqueResult(
+                approved=True,
+                critique_summary="Explicit planning critique disabled.",
+            )
+
+        tools_text = self._format_tools(available_tools)
+        system_prompt = f"""You are an independent SRE plan reviewer critiquing a proposed remediation plan BEFORE execution.
+
+Available Tools (discovered dynamically from active ToolRunner registry):
+{tools_text}
+
+Output MUST be valid JSON:
+{{
+  "approved": boolean,
+  "addresses_root_cause": boolean,
+  "contradicts_prior_attempts": boolean,
+  "tools_valid_and_appropriate": boolean,
+  "requires_further_investigation": boolean,
+  "should_escalate": boolean,
+  "critique_summary": string,
+  "recommended_adjustment": string | null
+}}
+
+Evaluation Criteria:
+- Does the proposed plan directly address the diagnosed root cause supported by Investigation Evidence?
+- Does it repeat an action/strategy from Prior Attempts that already failed execution or postconditions without a new justification?
+- Are all tool names and parameter keys/values valid in Available Tools and appropriate for the target resource (e.g. do NOT restart non-restartable external sources; do NOT run a bare `resume_workflow` when a restartable dependency is confirmed offline)?
+- If evidence contradicts the diagnosis or is missing a critical check, set `approved=false` and `requires_further_investigation=true`.
+- If no registered tool can fix the diagnosed cause, set `approved=false` and `should_escalate=true`.
+"""
+        user_prompt = json.dumps(
+            {
+                "retry_count": retry_count,
+                "triage": triage.model_dump(),
+                "proposed_actions": proposed_actions,
+            },
+            indent=2,
+        )
+        return self._call(system_prompt, user_prompt, PlanCritiqueResult, operation="critique_plan")
 
     def replan(
         self,
@@ -1168,17 +1363,23 @@ Produce the remediation plan as JSON."""
         verification_records: Optional[List[Dict[str, Any]]] = None,
         investigation_evidence: Optional[List[str]] = None,
         original_diagnosis: Optional[Dict[str, Any]] = None,
+        attempted_plan: Optional[List[Dict[str, Any]]] = None,
     ) -> ReplannerResult:
         reflection_fields = (
             """,
   "needs_further_investigation": boolean,
+  "outcome_classification": "INCORRECT_DIAGNOSIS" | "INEFFECTIVE_REMEDIATION" | "NEW_DOWNSTREAM_FAILURE" | "UNRECOVERABLE_DEFECT" | "UNKNOWN",
+  "expected_vs_observed": string | null,
   "outcome_reflection": string | null"""
             if self.enable_reflection
             else ""
         )
         reflection_instructions = (
             """
-- Perform outcome reflection: explicitly explain in `outcome_reflection` why the previous action or workflow restart failed. If the current logs/evidence are insufficient or contradict the original diagnosis, set `needs_further_investigation=true` so NOVA returns to diagnostic investigation with full context."""
+- Perform outcome reflection:
+  - Compare each planned action's `expected_outcome` against actual `Execution Records` (`command_success`, `postcondition_passed`, `postcondition_error`, `environment_changed`, `stdout`, `stderr`) and `Verification Records`.
+  - Classify the outcome in `outcome_classification`: `INCORRECT_DIAGNOSIS` (initial diagnosis was wrong), `INEFFECTIVE_REMEDIATION` (action failed/postcondition failed/no-op), `NEW_DOWNSTREAM_FAILURE` (upstream fix succeeded and a different downstream task failed), or `UNRECOVERABLE_DEFECT`.
+  - If the current logs/evidence are insufficient or contradict the original diagnosis, set `needs_further_investigation=true` so NOVA returns to diagnostic investigation with full context."""
             if self.enable_reflection
             else ""
         )
@@ -1193,7 +1394,7 @@ Output MUST be valid JSON:
   "new_target_service": string,
   "updated_triage_summary": string,
   "updated_hypothesis": string,
-  "new_failure_type": "SERVICE_OFFLINE" | "DATA_CORRUPTION" | "SOURCE_UNAVAILABLE" | "MALFORMED_INPUT" | "STALE_LOCKFILE" | "DEPENDENCY_FAILURE" | "UNKNOWN",
+  "new_failure_type": "SERVICE_OFFLINE" | "TRANSIENT" | "DATA_CORRUPTION" | "SOURCE_UNAVAILABLE" | "MALFORMED_INPUT" | "STALE_LOCKFILE" | "DEPENDENCY_FAILURE" | "UNKNOWN",
   "implicated_resource": string | null,
   "is_recoverable": boolean,
   "diagnosis_revision_needed": boolean,
@@ -1203,7 +1404,7 @@ Output MUST be valid JSON:
 }}
 
 Critical Reasoning Instructions:
-- Do NOT assume the previous action succeeded. Check Execution Records and Verification Records carefully.
+- Do NOT assume the previous action succeeded. Inspect `command_success`, `postcondition_passed`, `postcondition_error`, `environment_changed`, `parameters`, and `stdout`/`stderr` in Execution Records and Verification Records carefully.
 - If a remediation tool (e.g. restart_service, clear_lockfile) failed or failed its postcondition, revise the hypothesis (`diagnosis_revision_needed=true`) and determine an alternative strategy, additional investigation, or escalation.
 - If an upstream remediation tool succeeded and `resume_workflow` halted on a DIFFERENT downstream failed task, diagnose the newly surfaced failure in `new_target` from its log.
 - If an external source is unavailable, input data is malformed/corrupt, or no registered tool can fix the newly surfaced issue, set `is_escalation=true`, `escalation_reason` non-empty, and `is_recoverable=false`.
@@ -1212,6 +1413,7 @@ Critical Reasoning Instructions:
 """
         exec_json = json.dumps(execution_records or [], indent=2)
         verif_json = json.dumps(verification_records or [], indent=2)
+        plan_json = json.dumps(attempted_plan or [], indent=2)
         orig_diag_json = json.dumps(original_diagnosis or {}, indent=2)
         inv_text = "\n".join(f"- {ev}" for ev in (investigation_evidence or [])) or "None."
 
@@ -1220,6 +1422,9 @@ Original Target: {original_target}
 Action Attempted: {first_action_taken}
 Original Diagnosis:
 {orig_diag_json}
+
+Attempted Plan (with expected outcomes):
+{plan_json}
 
 Prior Investigation Evidence:
 {inv_text}
@@ -1237,5 +1442,14 @@ Diagnostic Log for {new_target}:
 
 Replan as JSON."""
 
-        return self._call(system_prompt, user_prompt, ReplannerResult, operation="replan")
+        res = self._call(system_prompt, user_prompt, ReplannerResult, operation="replan")
+        if not self.enable_reflection:
+            res = res.model_copy(
+                update={
+                    "outcome_reflection": None,
+                    "outcome_classification": None,
+                    "expected_vs_observed": None,
+                }
+            )
+        return res
 

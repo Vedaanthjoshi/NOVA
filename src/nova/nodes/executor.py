@@ -412,15 +412,53 @@ def create_executor_node(
                 }
 
         # Safe autonomous execution (or approved destructive execution)
+        pre_wf = None
+        try:
+            pre_wf = _get_env_state(resolved_env, state.get("workflow_run_id"))
+        except Exception:
+            pre_wf = None
+
         record = runner.execute(action)
+
+        post_wf = None
+        try:
+            post_wf = _get_env_state(resolved_env, state.get("workflow_run_id"))
+        except Exception:
+            post_wf = None
+
+        exec_id = (
+            record.execution_id
+            or state.get("workflow_run_id")
+            or (getattr(post_wf, "run_id", None) if post_wf is not None else None)
+        )
+        task_attempts = (
+            record.task_attempts
+            if record.task_attempts is not None
+            else (getattr(post_wf, "total_attempts", None) if post_wf is not None else None)
+        )
+        attempts_changed = (
+            pre_wf is not None
+            and post_wf is not None
+            and getattr(pre_wf, "total_attempts", None) is not None
+            and getattr(post_wf, "total_attempts", None) is not None
+            and getattr(post_wf, "total_attempts", None) != getattr(pre_wf, "total_attempts", None)
+        )
+
+        update_fields: Dict[str, Any] = {
+            "parameters": record.parameters or dict(action.parameters),
+            "command_success": record.success if record.command_success is None else record.command_success,
+            "execution_id": exec_id,
+            "task_attempts": task_attempts,
+        }
         if decision is not None:
-            record = record.model_copy(
-                update={
+            update_fields.update(
+                {
                     "approved_by": decision.approver_id,
                     "approver_role": decision.approver_role,
                     "approval_id": decision.approval_request_id,
                 }
             )
+        record = record.model_copy(update=update_fields)
 
         # Multi-Step Execution & Failure Handling
         retry_count = state.get("retry_count", 0)
@@ -430,6 +468,8 @@ def create_executor_node(
         # If action execution failed, stop remaining plan and route to verifier (which records
         # VerificationRecord and escalates if retry budget is exhausted).
         if not record.success:
+            if attempts_changed and record.tool_name == "resume_workflow":
+                record = record.model_copy(update={"environment_changed": True})
             reason = (
                 f"Execution failed for action '{action.action_id}' ({action.tool_name}): "
                 f"{record.stderr}. Aborting remaining plan."
@@ -450,6 +490,21 @@ def create_executor_node(
             bound_run_id=state.get("workflow_run_id"),
         )
         if postcondition_error:
+            combined_stderr = (
+                f"{record.stderr}\n{postcondition_error}".strip()
+                if record.stderr
+                else postcondition_error
+            )
+            record = record.model_copy(
+                update={
+                    "command_success": True,
+                    "success": False,
+                    "postcondition_passed": False,
+                    "postcondition_error": postcondition_error,
+                    "stderr": combined_stderr,
+                    "environment_changed": False,
+                }
+            )
             reason = (
                 f"Execution postcondition failed for '{action.action_id}' ({action.tool_name}): "
                 f"{postcondition_error}. Aborting remaining plan."
@@ -469,6 +524,9 @@ def create_executor_node(
                 "status": IncidentStatus.FAILED,
                 "final_summary": reason,
             }
+
+        if effective_risk != RiskLevel.READ_ONLY:
+            record = record.model_copy(update={"postcondition_passed": True})
 
         # Action succeeded and postcondition passed: advance to the next planned action
         next_index = index + 1

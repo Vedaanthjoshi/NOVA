@@ -121,8 +121,6 @@ class KestraGetWorkflowStatusTool(BaseTool):
                 if task.status == JobStatus.FAILED:
                     failed_jobs.append(tid)
 
-            summary_lines.append(f"Services: {state.services}")
-
             return ToolResult(
                 stdout="\n".join(summary_lines),
                 stderr="",
@@ -133,7 +131,6 @@ class KestraGetWorkflowStatusTool(BaseTool):
                     "execution_id": state.run_id,
                     "execution_state": state.execution_state,
                     "failed_jobs": failed_jobs,
-                    "services": state.services,
                     "total_attempts": state.total_attempts,
                 },
             )
@@ -385,14 +382,24 @@ class KestraResumeWorkflowTool(BaseTool):
                     success=False,
                 )
 
+            before_task_attempts = {tid: t.attempt_count for tid, t in current.jobs.items()}
             final_state = self.env.restart_execution(eid)
             failed_jobs = [tid for tid, t in final_state.jobs.items() if t.status == JobStatus.FAILED]
+            freshly_succeeded_tasks = [
+                tid
+                for tid, t in final_state.jobs.items()
+                if t.status == JobStatus.SUCCESS
+                and (t.last_attempt_state in (None, "SUCCESS"))
+                and t.attempt_count > before_task_attempts.get(tid, 0)
+            ]
+            task_attempts = {tid: t.attempt_count for tid, t in final_state.jobs.items()}
 
             if final_state.execution_state == "SUCCESS" and not failed_jobs:
                 return ToolResult(
                     stdout=(
                         f"Kestra execution '{eid}' ({final_state.workflow_id}) restarted and completed "
-                        f"with state SUCCESS (total_attempts={final_state.total_attempts})."
+                        f"with state SUCCESS (total_attempts={final_state.total_attempts}, "
+                        f"freshly_succeeded={freshly_succeeded_tasks})."
                     ),
                     stderr="",
                     exit_code=0,
@@ -402,6 +409,8 @@ class KestraResumeWorkflowTool(BaseTool):
                         "workflow_id": final_state.workflow_id,
                         "execution_state": final_state.execution_state,
                         "total_attempts": final_state.total_attempts,
+                        "task_attempts": task_attempts,
+                        "freshly_succeeded_tasks": freshly_succeeded_tasks,
                         "failed_jobs": [],
                     },
                 )
@@ -416,6 +425,8 @@ class KestraResumeWorkflowTool(BaseTool):
                     "workflow_id": final_state.workflow_id,
                     "execution_state": final_state.execution_state,
                     "total_attempts": final_state.total_attempts,
+                    "task_attempts": task_attempts,
+                    "freshly_succeeded_tasks": freshly_succeeded_tasks,
                     "failed_jobs": failed_jobs,
                 },
             )

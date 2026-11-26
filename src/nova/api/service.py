@@ -33,6 +33,7 @@ from nova.api.schemas import (
     PendingApprovalDTO,
 )
 from nova.config import settings
+from nova.environments.kestra_runner import KestraEnvironment
 from nova.environments.mock_workflow_runner import MockWorkflowRunner, ScenarioType, WorkflowState
 from nova.graph import build_nova_graph
 from nova.llm.client import BaseLLMClient, GeminiLLMClient, MockLLMClient
@@ -77,9 +78,11 @@ class IncidentService:
         checkpointer: Optional[BaseCheckpointSaver] = None,
         llm: Optional[BaseLLMClient] = None,
         max_workers: int = 4,
+        kestra_env: Optional[KestraEnvironment] = None,
     ):
         configure_logging(settings.log_level)
         self.env = env or MockWorkflowRunner(base_dir=settings.mock_env_dir)
+        self._injected_kestra_env = kestra_env
 
         # Durable SQLite checkpointer by default
         if checkpointer is not None:
@@ -121,6 +124,8 @@ class IncidentService:
         )
         self._running_tasks: Dict[str, concurrent.futures.Future[Any]] = {}
         self._incident_metadata: Dict[str, Dict[str, Any]] = {}
+        self._incident_envs: Dict[str, Any] = {}
+        self._incident_graphs: Dict[str, Any] = {}
         self._in_memory_audits: Dict[str, List[Dict[str, Any]]] = {}
         self._consumed_approvals: Set[Tuple[str, str]] = set()
         self._lock = threading.RLock()
@@ -140,7 +145,8 @@ class IncidentService:
     def _has_pending_interrupt(self, incident_id: str) -> bool:
         """Returns True if the checkpointed graph state has an unresolved HITL interrupt."""
         try:
-            st = self.graph.get_state({"configurable": {"thread_id": incident_id}})
+            inc_graph = self._incident_graphs.get(incident_id, self.graph)
+            st = inc_graph.get_state({"configurable": {"thread_id": incident_id}})
             return bool(st and st.tasks and st.tasks[0].interrupts)
         except Exception:
             return False
@@ -243,7 +249,8 @@ class IncidentService:
         clean_reason = redact_secrets(reason)
         telemetry.record_terminal_reason(incident_id, "FAILED", clean_reason)
         try:
-            self.graph.update_state(
+            inc_graph = self._incident_graphs.get(incident_id, self.graph)
+            inc_graph.update_state(
                 thread_config,
                 {
                     "status": IncidentStatus.FAILED,
@@ -286,10 +293,56 @@ class IncidentService:
                     "active or awaiting approval. Resolve or escalate it before starting another incident."
                 )
 
-            wf_state = self.env.get_state()
+            use_kestra = request.environment == "kestra"
+            if use_kestra:
+                if not request.execution_id or not request.execution_id.strip():
+                    raise ValueError("execution_id is required when environment='kestra'.")
+                eid = request.execution_id.strip()
+                if self._injected_kestra_env is not None:
+                    inc_env = self._injected_kestra_env
+                    inc_env.bind_execution(eid)
+                else:
+                    inc_env = KestraEnvironment(
+                        kestra_url=request.kestra_url or "http://127.0.0.1:8080",
+                        default_execution_id=eid,
+                    )
+                try:
+                    wf_state = inc_env.get_state(execution_id=eid)
+                except Exception as exc:
+                    raise ValueError(f"Failed to query Kestra execution '{eid}': {exc}") from exc
+                if wf_state is None:
+                    raise ValueError(f"Kestra execution '{eid}' not found.")
+                inc_graph = build_nova_graph(
+                    env=inc_env,
+                    checkpointer=self.checkpointer,
+                    require_approval=True,
+                    llm=self.llm,
+                )
+            else:
+                inc_env = self.env
+                inc_graph = self.graph
+                wf_state = inc_env.get_state()
+
             bound_wf_id = wf_state.workflow_id if wf_state else None
             bound_run_id = wf_state.run_id if wf_state else None
+            baseline_attempts = getattr(wf_state, "total_attempts", None) if wf_state else None
+            baseline_task_attempts = None
+            baseline_task_states = None
+            if wf_state and getattr(wf_state, "jobs", None):
+                t_atts = {
+                    tid: getattr(t, "attempt_count", 0)
+                    for tid, t in wf_state.jobs.items()
+                    if hasattr(t, "attempt_count")
+                }
+                if t_atts:
+                    baseline_task_attempts = t_atts
+                baseline_task_states = {
+                    tid: (t.status.value if hasattr(t.status, "value") else str(t.status))
+                    for tid, t in wf_state.jobs.items()
+                }
             self._active_incident_id = incident_id
+            self._incident_envs[incident_id] = inc_env
+            self._incident_graphs[incident_id] = inc_graph
 
             self._incident_metadata[incident_id] = {
                 "incident_id": incident_id,
@@ -297,6 +350,8 @@ class IncidentService:
                 "updated_at": now_iso,
                 "target_service": request.target_service,
                 "raw_symptoms": request.raw_symptoms,
+                "environment": request.environment,
+                "execution_id": bound_run_id,
             }
 
         if self._store is not None:
@@ -317,6 +372,9 @@ class IncidentService:
             "status": IncidentStatus.TRIGGERED,
             "workflow_id": bound_wf_id,
             "workflow_run_id": bound_run_id,
+            "baseline_attempts": baseline_attempts,
+            "baseline_task_attempts": baseline_task_attempts,
+            "baseline_task_states": baseline_task_states,
             "triage_summary": None,
             "root_cause_hypothesis": None,
             "plan": [],
@@ -331,6 +389,9 @@ class IncidentService:
             "investigation_evidence": [],
             "investigation_steps": 0,
             "max_investigation_steps": request.max_investigation_steps,
+            "reflection_history": [],
+            "hypothesis_revisions": [],
+            "plan_revisions": [],
         }
 
         thread_config = {"configurable": {"thread_id": incident_id}}
@@ -345,8 +406,10 @@ class IncidentService:
                         "incident_execution_started",
                         f"Starting graph execution for incident {incident_id}",
                         target_service=request.target_service or "UNKNOWN",
+                        environment=request.environment,
+                        execution_id=bound_run_id,
                     )
-                    self.graph.invoke(initial_state, thread_config)
+                    inc_graph.invoke(initial_state, thread_config)
                 except (RuntimeError, concurrent.futures.CancelledError) as re_err:
                     if "shutdown" in str(re_err).lower():
                         log_event(
@@ -521,6 +584,9 @@ class IncidentService:
             max_investigation_steps=vals.get("max_investigation_steps", 5),
             investigation_evidence=list(vals.get("investigation_evidence") or []),
             diagnostic_history=_to_dicts(list(vals.get("diagnostic_history") or [])),
+            reflection_history=list(vals.get("reflection_history") or []),
+            hypothesis_revisions=list(vals.get("hypothesis_revisions") or []),
+            plan_revisions=list(vals.get("plan_revisions") or []),
             failure_type=vals.get("failure_type"),
             implicated_resource=vals.get("implicated_resource"),
             is_recoverable=vals.get("is_recoverable"),
@@ -636,10 +702,35 @@ class IncidentService:
             expected_action_hash = interrupt_val.get("action_hash")
             tool_name = interrupt_val.get("tool_name")
 
-            # M11: Verify workflow run binding before resuming a destructive operation
+            # M11/M13: Verify workflow run binding before resuming a destructive operation
             bound_run_id = interrupt_val.get("workflow_run_id") or checkpoint_state.values.get("workflow_run_id")
+            bound_wf_id = interrupt_val.get("workflow_id") or checkpoint_state.values.get("workflow_id")
+            inc_env = self._incident_envs.get(incident_id)
+            inc_graph = self._incident_graphs.get(incident_id)
+            if inc_env is None and bound_wf_id and "/" in str(bound_wf_id) and bound_run_id:
+                inc_env = (
+                    self._injected_kestra_env
+                    if self._injected_kestra_env is not None
+                    else KestraEnvironment(default_execution_id=bound_run_id)
+                )
+                inc_env.bind_execution(bound_run_id)
+                inc_graph = build_nova_graph(
+                    env=inc_env,
+                    checkpointer=self.checkpointer,
+                    require_approval=True,
+                    llm=self.llm,
+                )
+                self._incident_envs[incident_id] = inc_env
+                self._incident_graphs[incident_id] = inc_graph
+            inc_env = inc_env or self.env
+            inc_graph = inc_graph or self.graph
+
             if bound_run_id:
-                current_wf = self.env.get_state()
+                current_wf = (
+                    inc_env.get_state(execution_id=bound_run_id)
+                    if hasattr(inc_env, "bind_execution")
+                    else inc_env.get_state()
+                )
                 if current_wf is None or current_wf.run_id != bound_run_id:
                     raise ConflictError(
                         f"Workflow run binding mismatch: approval was requested for run '{bound_run_id}', "
@@ -741,7 +832,7 @@ class IncidentService:
                             f"Resuming incident {incident_id} with approved={request.approved}",
                             action_id=request.action_id,
                         )
-                        self.graph.invoke(Command(resume=decision), thread_config)
+                        inc_graph.invoke(Command(resume=decision), thread_config)
                     except (RuntimeError, concurrent.futures.CancelledError) as re_err:
                         if "shutdown" in str(re_err).lower():
                             log_event(

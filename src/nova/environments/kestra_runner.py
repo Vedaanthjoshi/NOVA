@@ -51,10 +51,13 @@ class KestraTaskState(BaseModel):
     status: JobStatus
     raw_state: str
     attempt_count: int = 0
+    last_attempt_state: Optional[str] = None
+    is_container: bool = False
     task_run_id: Optional[str] = None
     exit_code: Optional[int] = None
     error_message: Optional[str] = None
     dependencies: List[str] = Field(default_factory=list)
+    outputs: Dict[str, Any] = Field(default_factory=dict)
 
 
 class KestraWorkflowState(BaseModel):
@@ -292,13 +295,24 @@ class KestraEnvironment:
 
         jobs: Dict[str, KestraTaskState] = {}
         total_attempts = 0
-        for tr in raw.get("taskRunList", []):
+        task_runs = raw.get("taskRunList", [])
+        parent_run_ids = {
+            tr.get("parentTaskRunId")
+            for tr in task_runs
+            if isinstance(tr, dict) and tr.get("parentTaskRunId")
+        }
+        for tr in task_runs:
             tid = tr.get("taskId")
             if not tid:
                 continue
             tr_state = (tr.get("state") or {}).get("current", "UNKNOWN")
             attempts = tr.get("attempts") or []
             att_count = len(attempts)
+            last_att_state = (
+                (attempts[-1].get("state") or {}).get("current")
+                if attempts and isinstance(attempts[-1], dict)
+                else None
+            )
             total_attempts += att_count
             err_msg: Optional[str] = None
             if _map_kestra_state(tr_state) == JobStatus.FAILED:
@@ -322,10 +336,13 @@ class KestraEnvironment:
                 status=_map_kestra_state(tr_state),
                 raw_state=tr_state,
                 attempt_count=att_count,
+                last_attempt_state=last_att_state,
+                is_container=(tr.get("id") in parent_run_ids) or tid.startswith("if_"),
                 task_run_id=tr.get("id"),
                 exit_code=0 if tr_state == "SUCCESS" else (1 if _map_kestra_state(tr_state) == JobStatus.FAILED else None),
                 error_message=err_msg,
                 dependencies=deps_info.get(tid, []),
+                outputs=tr.get("outputs") or {},
             )
 
         pg_ok = self.check_service_status("pgdatabase").get("healthy", False)
@@ -442,16 +459,34 @@ class KestraEnvironment:
                     "detail": str(exc).strip(),
                 }
 
-        # upstream_source (read-only reachability check)
+        # upstream_source (read-only reachability check; dynamically detects HTTP Download URI from bound flow if present)
+        probe_url = self.source_probe_url
+        if self.default_execution_id:
+            try:
+                raw = self.get_execution_raw(self.default_execution_id)
+                ns = raw.get("namespace")
+                fid = raw.get("flowId")
+                if ns and fid:
+                    flow = self._request("GET", f"/flows/{ns}/{fid}").json()
+                    for t in flow.get("tasks") or []:
+                        if isinstance(t, dict) and t.get("type") == "io.kestra.plugin.core.http.Download":
+                            uri = t.get("uri")
+                            if isinstance(uri, str) and uri.startswith("http") and "{{" not in uri:
+                                probe_url = uri
+                                break
+            except Exception:
+                pass
         try:
-            r = httpx.head(self.source_probe_url, timeout=5.0, follow_redirects=True)
+            r = httpx.head(probe_url, timeout=5.0, follow_redirects=True)
+            if r.status_code == 405:
+                r = httpx.get(probe_url, timeout=5.0, follow_redirects=True)
             ok = r.status_code < 400
             return {
                 "service": "upstream_source",
                 "status": "REACHABLE" if ok else f"HTTP_{r.status_code}",
                 "healthy": ok,
                 "registered": True,
-                "detail": f"HTTP {r.status_code} from {self.source_probe_url}",
+                "detail": f"HTTP {r.status_code} from {probe_url}",
             }
         except Exception as exc:
             return {
@@ -506,16 +541,295 @@ class KestraEnvironment:
             time.sleep(1.0)
         return (False, f"Container '{self.pg_container_name}' started, but PostgreSQL did not become ready in 20s.")
 
-    # --- Independent Read-Only PostgreSQL Output Verification ---
+    # --- Fresh Task-Attempt Attribution & Output Verification (M13) ---
 
-    def verify_output(self, expected: Optional[Dict[str, Any]] = None) -> Tuple[bool, Dict[str, Any], str]:
+    def verify_task_attempt_recovery(
+        self,
+        workflow_state: KestraWorkflowState,
+        baseline_task_attempts: Optional[Dict[str, int]] = None,
+        baseline_task_states: Optional[Dict[str, str]] = None,
+        execution_history: Optional[List[Any]] = None,
+        expected: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, Dict[str, Any], str]:
         """
-        Opens an independent read-only PostgreSQL connection to verify the committed
-        output partition: row count, distinct unique_row_id count, and sum(total_amount).
+        Verifies that recovery is backed by fresh SUCCESS task attempts attributable
+        to remediation and retry — NOT merely an upstream attempt bump or stale DB rows.
+        """
+        expected = expected or {}
+        baseline_task_attempts = baseline_task_attempts or {}
+        baseline_task_states = baseline_task_states or {}
+
+        # Collect freshly succeeded tasks reported by successful resume_workflow execution(s)
+        resume_records: List[Dict[str, Any]] = []
+        fresh_from_resume: set[str] = set()
+        for rec in execution_history or []:
+            rec_dict = rec.model_dump() if hasattr(rec, "model_dump") else dict(rec)
+            if rec_dict.get("tool_name") == "resume_workflow" and rec_dict.get("success"):
+                resume_records.append(rec_dict)
+                details = rec_dict.get("details") or {}
+                for tid in details.get("freshly_succeeded_tasks") or []:
+                    fresh_from_resume.add(tid)
+
+        if not resume_records:
+            return (
+                False,
+                {"reason": "missing_successful_resume_workflow"},
+                "Verification failed: no successful resume_workflow retry execution recorded.",
+            )
+
+        # Determine required downstream / load-merge tasks for this workflow
+        verifier_kind = expected.get("verifier")
+        if not verifier_kind:
+            if workflow_state.flow_id == "04_postgres_taxi" or expected.get("taxi") or expected.get("table"):
+                verifier_kind = "postgres_taxi"
+            elif workflow_state.flow_id == "03_getting_started_data_pipeline":
+                verifier_kind = "duckdb"
+
+        required_tasks: List[str] = list(expected.get("required_tasks") or [])
+        if not required_tasks and verifier_kind == "postgres_taxi":
+            taxi = expected.get("taxi") or (workflow_state.inputs or {}).get("taxi") or "green"
+            required_tasks = [
+                f"{taxi}_copy_in_to_staging_table",
+                f"{taxi}_add_unique_id_and_filename",
+                f"{taxi}_merge_data",
+            ]
+        elif not required_tasks and verifier_kind == "duckdb":
+            required_tasks = ["transform", "query"]
+
+        # Any leaf worker task that was FAILED/non-SUCCESS at baseline must also have freshly succeeded.
+        # Flow-control container tasks (e.g. Kestra `If` branching nodes) transition to SUCCESS when their
+        # child tasks recover without incrementing their own attempt array, so only leaf tasks require fresh attempts.
+        if baseline_task_states:
+            for tid, prev_status in baseline_task_states.items():
+                if prev_status != JobStatus.SUCCESS.value and tid not in required_tasks:
+                    t_obj = workflow_state.jobs.get(tid)
+                    if t_obj is not None and t_obj.is_container:
+                        continue
+                    required_tasks.append(tid)
+
+        missing_tasks: List[str] = []
+        stale_tasks: List[str] = []
+        unsuccessful_tasks: List[str] = []
+        verified_tasks: Dict[str, Any] = {}
+
+        for tid in required_tasks:
+            task = workflow_state.jobs.get(tid)
+            if task is None:
+                missing_tasks.append(tid)
+                continue
+            if task.status != JobStatus.SUCCESS or (
+                task.last_attempt_state is not None and task.last_attempt_state != "SUCCESS"
+            ):
+                unsuccessful_tasks.append(
+                    f"{tid} (status={task.status.value}, last_attempt={task.last_attempt_state})"
+                )
+                continue
+
+            base_att = baseline_task_attempts.get(tid)
+            has_fresh_attempt = False
+            if base_att is not None:
+                has_fresh_attempt = task.attempt_count > base_att
+            elif baseline_task_attempts:
+                # Task wasn't in baseline_task_attempts because it hadn't run yet -> attempt_count > 0 is fresh
+                has_fresh_attempt = task.attempt_count > 0
+            elif tid in fresh_from_resume:
+                has_fresh_attempt = True
+
+            if not has_fresh_attempt:
+                stale_tasks.append(
+                    f"{tid} (baseline_attempts={base_att}, observed_attempts={task.attempt_count})"
+                )
+            else:
+                verified_tasks[tid] = {
+                    "attempt_count": task.attempt_count,
+                    "baseline_attempts": base_att,
+                    "last_attempt_state": task.last_attempt_state or "SUCCESS",
+                }
+
+        if missing_tasks or unsuccessful_tasks or stale_tasks:
+            parts = []
+            if missing_tasks:
+                parts.append(f"missing required tasks: {missing_tasks}")
+            if unsuccessful_tasks:
+                parts.append(f"tasks not ending in SUCCESS: {unsuccessful_tasks}")
+            if stale_tasks:
+                parts.append(f"tasks lacking fresh post-remediation attempts: {stale_tasks}")
+            msg = (
+                "Verification failed: recovery requires fresh successful downstream/remediation task attempts; "
+                + "; ".join(parts)
+            )
+            return (
+                False,
+                {
+                    "missing_tasks": missing_tasks,
+                    "unsuccessful_tasks": unsuccessful_tasks,
+                    "stale_tasks": stale_tasks,
+                    "verified_tasks": verified_tasks,
+                },
+                msg,
+            )
+
+        # If no required_tasks list was available (generic flow), ensure at least one non-baseline-SUCCESS task freshly succeeded
+        if not required_tasks:
+            fresh_any = [
+                tid
+                for tid, task in workflow_state.jobs.items()
+                if task.status == JobStatus.SUCCESS
+                and (task.last_attempt_state in (None, "SUCCESS"))
+                and (
+                    task.attempt_count > baseline_task_attempts.get(tid, 0)
+                    or tid in fresh_from_resume
+                )
+            ]
+            if not fresh_any:
+                return (
+                    False,
+                    {"fresh_tasks": []},
+                    "Verification failed: no fresh successful task attempt attributable to remediation/retry.",
+                )
+            verified_tasks = {
+                tid: {"attempt_count": workflow_state.jobs[tid].attempt_count}
+                for tid in fresh_any
+            }
+
+        return (
+            True,
+            {"verified_tasks": verified_tasks, "verifier_kind": verifier_kind or "generic"},
+            f"Fresh task-attempt attribution passed for tasks: {sorted(verified_tasks.keys())}.",
+        )
+
+    # --- Independent Read-Only Output Verification ---
+
+    def _verify_duckdb_output(
+        self,
+        expected: Dict[str, Any],
+        execution_id: Optional[str] = None,
+    ) -> Tuple[bool, Dict[str, Any], str]:
+        """Verifies stored DuckDB aggregation output from a Kestra execution."""
+        eid = execution_id or expected.get("execution_id") or self.default_execution_id
+        if not eid:
+            return (False, {}, "DuckDB verification failed: no execution_id available.")
+        wf_state = self.get_state(execution_id=eid)
+        if wf_state is None:
+            return (False, {}, f"DuckDB verification failed: execution '{eid}' not found.")
+
+        task_id = expected.get("duckdb_task_id", "query")
+        query_task = wf_state.jobs.get(task_id)
+        if query_task is None or query_task.status != JobStatus.SUCCESS:
+            return (
+                False,
+                {"task_id": task_id, "status": query_task.status.value if query_task else "MISSING"},
+                f"DuckDB verification failed: task '{task_id}' did not complete with SUCCESS.",
+            )
+
+        outputs = query_task.outputs or {}
+        uri = outputs.get("uri")
+        size = outputs.get("size")
+        if not uri and isinstance(outputs.get("outputs"), list):
+            for entry in reversed(outputs["outputs"]):
+                if isinstance(entry, dict) and entry.get("uri"):
+                    uri = entry.get("uri")
+                    size = entry.get("size")
+                    break
+        details: Dict[str, Any] = {
+            "execution_id": eid,
+            "task_id": task_id,
+            "output_uri": uri,
+            "output_size": size,
+        }
+
+        if not uri:
+            return (
+                False,
+                details,
+                f"DuckDB verification failed: task '{task_id}' produced no stored output URI.",
+            )
+        if size is not None and int(size) <= 0:
+            return (
+                False,
+                details,
+                f"DuckDB verification failed: task '{task_id}' stored output size is {size} (expected > 0).",
+            )
+
+        # Fetch the stored Ion/output file from Kestra storage to confirm non-empty aggregation rows
+        try:
+            resp = self._request("GET", f"/executions/{eid}/file", params={"path": uri})
+            if resp.status_code != 200:
+                return (
+                    False,
+                    details,
+                    f"DuckDB verification failed: unable to read stored output '{uri}' (HTTP {resp.status_code}).",
+                )
+            body = resp.text.strip()
+            lines = [ln for ln in body.splitlines() if ln.strip()]
+            details["stored_record_count"] = len(lines)
+            details["sample_record"] = lines[0][:200] if lines else ""
+            if not lines:
+                return (
+                    False,
+                    details,
+                    f"DuckDB verification failed: stored output file '{uri}' is empty.",
+                )
+            expected_fields = expected.get("expected_fields") or []
+            for fld in expected_fields:
+                if fld not in body:
+                    return (
+                        False,
+                        details,
+                        f"DuckDB verification failed: expected field '{fld}' missing from stored output.",
+                    )
+        except Exception as exc:
+            return (
+                False,
+                {**details, "error": str(exc)},
+                f"DuckDB stored output read error: {exc}",
+            )
+
+        return (
+            True,
+            details,
+            f"DuckDB read-only output verification passed for '{task_id}' ({details.get('stored_record_count', size)} records).",
+        )
+
+    def verify_output(
+        self,
+        expected: Optional[Dict[str, Any]] = None,
+        execution_id: Optional[str] = None,
+    ) -> Tuple[bool, Dict[str, Any], str]:
+        """
+        Opens an independent read-only verification check for the workflow output:
+        - PostgreSQL taxi workflow (`04_postgres_taxi`): row count, distinct unique_row_id, sum(total_amount).
+        - DuckDB pipeline (`03_getting_started_data_pipeline`): stored DuckDB aggregation URI & non-empty records.
         """
         expected = expected or {}
         if self._pg_verifier is not None:
             return self._pg_verifier(expected)
+
+        verifier_kind = expected.get("verifier")
+        eid = execution_id or expected.get("execution_id") or self.default_execution_id
+        if not verifier_kind and eid:
+            try:
+                wf_state = self.get_state(execution_id=eid)
+                if wf_state is not None:
+                    if wf_state.flow_id == "03_getting_started_data_pipeline":
+                        verifier_kind = "duckdb"
+                    elif wf_state.flow_id == "04_postgres_taxi":
+                        verifier_kind = "postgres_taxi"
+                    elif "query" in wf_state.jobs:
+                        q_out = wf_state.jobs["query"].outputs or {}
+                        if q_out.get("uri") or isinstance(q_out.get("outputs"), list):
+                            verifier_kind = "duckdb"
+            except Exception:
+                pass
+
+        if verifier_kind == "execution_only":
+            return (True, {"verifier": "execution_only"}, "Execution-only output verification passed.")
+
+        if verifier_kind == "duckdb":
+            return self._verify_duckdb_output(expected, execution_id=eid)
+
+        if not verifier_kind and not any(k in expected for k in ("taxi", "table", "expected_row_count", "year", "month")):
+            return (True, {"verifier": "execution_only"}, "No external output table configured; task-attempt verification passed.")
 
         taxi = expected.get("taxi", "green")
         year = expected.get("year", "2020")

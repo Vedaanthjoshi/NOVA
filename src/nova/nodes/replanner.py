@@ -1,12 +1,23 @@
+import inspect
 import logging
 import re
-from typing import Any, Dict
+from typing import Any, Dict, List
 from nova.environments.mock_workflow_runner import MockWorkflowRunner
 from nova.llm.client import BaseLLMClient
 from nova.observability import incident_context, log_event, redact_secrets, telemetry
-from nova.state import IncidentStatus, NovaGraphState
+from nova.state import IncidentStatus, NovaGraphState, build_prior_attempts
 
 logger = logging.getLogger("nova.nodes.replanner")
+
+
+def _call_replan(llm: BaseLLMClient, **kwargs: Any):
+    """Calls llm.replan while preserving backward compatibility with custom test overrides."""
+    sig = inspect.signature(llm.replan)
+    has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    if has_varkw:
+        return llm.replan(**kwargs)
+    filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    return llm.replan(**filtered)
 
 
 def create_replanner_node(env: Any, llm: BaseLLMClient):
@@ -99,22 +110,31 @@ def create_replanner_node(env: Any, llm: BaseLLMClient):
         original_diagnosis = {
             "failure_type": state.get("failure_type"),
             "implicated_resource": state.get("implicated_resource"),
+            "is_recoverable": state.get("is_recoverable"),
             "triage_summary": state.get("triage_summary"),
             "root_cause_hypothesis": state.get("root_cause_hypothesis"),
         }
+        prior_attempts = build_prior_attempts(state)
+        exec_records_payload = [p for p in prior_attempts if p.get("kind") == "execution"]
+        verif_records_payload = [p for p in prior_attempts if p.get("kind") == "verification"]
 
         try:
-            replan_result = llm.replan(
+            replan_result = _call_replan(
+                llm,
                 original_target=original_target,
                 first_action_taken=first_action_taken,
                 new_target=new_target,
                 new_log_content=new_diagnostic_log,
                 verification_evidence=last_verification.evidence,
                 retry_count=new_retry_count,
-                execution_records=[r.model_dump() if hasattr(r, "model_dump") else r for r in execution_history],
-                verification_records=[v.model_dump() if hasattr(v, "model_dump") else v for v in verification_history],
+                execution_records=exec_records_payload,
+                verification_records=verif_records_payload,
                 investigation_evidence=state.get("investigation_evidence", []),
                 original_diagnosis=original_diagnosis,
+                attempted_plan=[
+                    a.model_dump() if hasattr(a, "model_dump") else dict(a)
+                    for a in (state.get("plan") or [])
+                ],
             )
         except Exception as exc:
             reason = f"Replanning failed due to LLM error: {redact_secrets(str(exc))}"
@@ -128,24 +148,107 @@ def create_replanner_node(env: Any, llm: BaseLLMClient):
                 "current_action_index": 0,
             }
 
+        reflection_entries: List[Dict[str, Any]] = []
+        evidence_entries: List[str] = []
+        revision_entries: List[Dict[str, Any]] = []
+
+        has_budget_for_reinvestigate = (
+            state.get("investigation_steps", 0) < state.get("max_investigation_steps", 5)
+        )
+        can_reinvestigate = bool(replan_result.needs_further_investigation and has_budget_for_reinvestigate)
+
+        if (
+            replan_result.outcome_reflection
+            or replan_result.outcome_classification
+            or replan_result.expected_vs_observed
+        ):
+            reflection_entries.append(
+                {
+                    "phase": "outcome",
+                    "retry_count": new_retry_count,
+                    "needs_further_investigation": can_reinvestigate,
+                    "requested_further_investigation": replan_result.needs_further_investigation,
+                    "outcome_classification": replan_result.outcome_classification,
+                    "expected_vs_observed": replan_result.expected_vs_observed,
+                    "outcome_reflection": replan_result.outcome_reflection,
+                    "alternative_strategy_notes": replan_result.alternative_strategy_notes,
+                    "diagnosis_revision_needed": replan_result.diagnosis_revision_needed,
+                }
+            )
+            if replan_result.outcome_reflection:
+                evidence_entries.append(
+                    f"[Outcome Reflection cycle {new_retry_count}] {replan_result.outcome_reflection}"
+                )
+        elif replan_result.alternative_strategy_notes:
+            evidence_entries.append(
+                f"[Replanner Strategy cycle {new_retry_count}] {replan_result.alternative_strategy_notes}"
+            )
+
+        if (
+            replan_result.diagnosis_revision_needed
+            or replan_result.new_failure_type != original_diagnosis.get("failure_type")
+            or replan_result.implicated_resource != original_diagnosis.get("implicated_resource")
+            or replan_result.updated_hypothesis != original_diagnosis.get("root_cause_hypothesis")
+        ):
+            revision_entries.append(
+                {
+                    "phase": "replanner",
+                    "retry_count": new_retry_count,
+                    "previous": original_diagnosis,
+                    "revised": {
+                        "target_service": replan_result.new_target_service,
+                        "failure_type": replan_result.new_failure_type,
+                        "implicated_resource": replan_result.implicated_resource,
+                        "is_recoverable": replan_result.is_recoverable,
+                        "triage_summary": replan_result.updated_triage_summary,
+                        "root_cause_hypothesis": replan_result.updated_hypothesis,
+                    },
+                    "classification": replan_result.outcome_classification,
+                }
+            )
+
+        # Preserve revised diagnosis and outcome reflection even on direct escalation
+        revised_state: Dict[str, Any] = {
+            "retry_count": new_retry_count,
+            "target_service": replan_result.new_target_service,
+            "failure_type": replan_result.new_failure_type,
+            "implicated_resource": replan_result.implicated_resource,
+            "is_recoverable": replan_result.is_recoverable,
+            "triage_summary": replan_result.updated_triage_summary,
+            "root_cause_hypothesis": replan_result.updated_hypothesis,
+            "plan": [],
+            "current_action_index": 0,
+        }
+        if reflection_entries:
+            revised_state["reflection_history"] = reflection_entries
+        if evidence_entries:
+            revised_state["investigation_evidence"] = evidence_entries
+        if revision_entries:
+            revised_state["hypothesis_revisions"] = revision_entries
+
         # Check for immediate escalation during replanning
         if replan_result.is_escalation:
             reason = f"Incident Escalated during replanning: {replan_result.escalation_reason}"
             telemetry.record_terminal_reason(state.get("incident_id"), "ESCALATED", reason)
             log_event(logger, logging.WARNING, "replanner_escalated", reason)
-            return {
-                "retry_count": new_retry_count,
-                "status": IncidentStatus.ESCALATED,
-                "final_summary": reason,
-                "plan": [],
-                "current_action_index": 0,
-            }
+            revised_state["status"] = IncidentStatus.ESCALATED
+            revised_state["final_summary"] = reason
+            return revised_state
 
-        # Check for further investigation routing (Phase 3D + Outcome Reflection)
-        can_reinvestigate = (
-            replan_result.needs_further_investigation
-            and state.get("investigation_steps", 0) < state.get("max_investigation_steps", 5)
-        )
+        # If further investigation is necessary but budget is exhausted, escalate cleanly
+        # instead of blindly proceeding with an unsupported remediation plan.
+        if replan_result.needs_further_investigation and not has_budget_for_reinvestigate:
+            max_steps = state.get("max_investigation_steps", 5)
+            reason = (
+                f"Incident Escalated: Replanner determined further diagnostic investigation is necessary, "
+                f"but investigation budget ({max_steps} steps) is exhausted."
+            )
+            telemetry.record_terminal_reason(state.get("incident_id"), "ESCALATED", reason)
+            log_event(logger, logging.WARNING, "replanner_investigation_budget_exhausted", reason, max_steps=max_steps)
+            revised_state["status"] = IncidentStatus.ESCALATED
+            revised_state["final_summary"] = reason
+            return revised_state
+
         next_status = IncidentStatus.TRIAGING if can_reinvestigate else IncidentStatus.REPLANNING
 
         log_event(
@@ -160,33 +263,7 @@ def create_replanner_node(env: Any, llm: BaseLLMClient):
             reinvestigate=can_reinvestigate,
         )
 
-        # --- Step 3: Map validated output into graph state ---
-        out_state: Dict[str, Any] = {
-            "retry_count": new_retry_count,
-            "status": next_status,
-            "target_service": replan_result.new_target_service,
-            "failure_type": replan_result.new_failure_type,
-            "implicated_resource": replan_result.implicated_resource,
-            "is_recoverable": replan_result.is_recoverable,
-            "triage_summary": replan_result.updated_triage_summary,
-            "root_cause_hypothesis": replan_result.updated_hypothesis,
-            "plan": [],
-            "current_action_index": 0,
-        }
-        if replan_result.outcome_reflection or replan_result.alternative_strategy_notes:
-            out_state["reflection_history"] = [
-                {
-                    "phase": "outcome",
-                    "retry_count": new_retry_count,
-                    "needs_further_investigation": can_reinvestigate,
-                    "outcome_reflection": replan_result.outcome_reflection,
-                    "alternative_strategy_notes": replan_result.alternative_strategy_notes,
-                }
-            ]
-            if replan_result.outcome_reflection:
-                out_state["investigation_evidence"] = [
-                    f"[Outcome Reflection cycle {new_retry_count}] {replan_result.outcome_reflection}"
-                ]
-        return out_state
+        revised_state["status"] = next_status
+        return revised_state
 
     return replanner_node

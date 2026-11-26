@@ -5,7 +5,7 @@ Enforces strict input validation, type safety, and standardized responses
 for incident submission, status polling, and Human-in-the-Loop approvals.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 
 from nova.state import IncidentStatus
@@ -37,6 +37,18 @@ class IncidentTriggerRequest(BaseModel):
         ge=1,
         le=15,
         description="Maximum autonomous investigation diagnostic steps.",
+    )
+    environment: Literal["mock", "kestra"] = Field(
+        default="mock",
+        description="Execution backend to bind: 'mock' (MockWorkflowRunner) or 'kestra' (KestraEnvironment).",
+    )
+    execution_id: Optional[str] = Field(
+        default=None,
+        description="Kestra execution ID to bind when environment='kestra'.",
+    )
+    kestra_url: Optional[str] = Field(
+        default=None,
+        description="Optional Kestra server base URL override when environment='kestra'.",
     )
 
 
@@ -126,6 +138,9 @@ class IncidentStateResponse(BaseModel):
     max_investigation_steps: int = 5
     investigation_evidence: List[str] = Field(default_factory=list)
     diagnostic_history: List[Dict[str, Any]] = Field(default_factory=list)
+    reflection_history: List[Dict[str, Any]] = Field(default_factory=list)
+    hypothesis_revisions: List[Dict[str, Any]] = Field(default_factory=list)
+    plan_revisions: List[Dict[str, Any]] = Field(default_factory=list)
 
     # Diagnosis & Planning
     failure_type: Optional[str] = None

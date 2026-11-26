@@ -27,10 +27,18 @@ class DiagnosticToolCall(BaseModel):
 
 
 class DiagnosticReflection(BaseModel):
-    """Lightweight diagnostic self-critique evaluating evidence sufficiency and alternatives."""
+    """Diagnostic self-critique evaluating evidence sufficiency, observations, and alternatives."""
     evidence_sufficient: bool = Field(
         default=True,
         description="True only if gathered observations conclusively support the diagnosis without guessing."
+    )
+    supporting_observations: List[str] = Field(
+        default_factory=list,
+        description="Specific collected observations that directly support the leading hypothesis."
+    )
+    contradicting_observations: List[str] = Field(
+        default_factory=list,
+        description="Observations that weaken or contradict the leading or prior hypothesis."
     )
     alternative_hypotheses: List[str] = Field(
         default_factory=list,
@@ -39,6 +47,10 @@ class DiagnosticReflection(BaseModel):
     remaining_uncertainty: Optional[str] = Field(
         default=None,
         description="Any remaining ambiguity or unverified assumption in the evidence."
+    )
+    recommended_diagnostic_tool: Optional[DiagnosticToolCall] = Field(
+        default=None,
+        description="Specific distinguishing diagnostic observation to run when evidence_sufficient is False."
     )
 
 
@@ -142,6 +154,10 @@ class TriageResult(BaseModel):
         default=None,
         description="Notes from replanning explaining why previous remediation failed or what changed."
     )
+    critique_feedback: Optional[str] = Field(
+        default=None,
+        description="Critique feedback when revising a rejected initial remediation plan."
+    )
 
 
 class PlannedActionSchema(BaseModel):
@@ -178,7 +194,7 @@ class PlannedActionSchema(BaseModel):
 
 
 class PlanningReflection(BaseModel):
-    """Lightweight planning self-critique verifying alignment with root cause and prior outcomes."""
+    """Planning self-critique verifying alignment with root cause, tool appropriateness, and prior outcomes."""
     addresses_root_cause: bool = Field(
         default=True,
         description="Whether the proposed actions directly resolve the verified root cause."
@@ -187,9 +203,59 @@ class PlanningReflection(BaseModel):
         default=False,
         description="True if this plan repeats a strategy that already failed without new justification."
     )
+    requires_revision: bool = Field(
+        default=False,
+        description="True if the plan has flaws and must be revised before execution."
+    )
+    requires_further_investigation: bool = Field(
+        default=False,
+        description="True if evidence is insufficient/contradictory and triage must inspect further."
+    )
+    should_escalate: bool = Field(
+        default=False,
+        description="True if no valid automated action can resolve the diagnosed cause."
+    )
+    critique_notes: Optional[str] = Field(
+        default=None,
+        description="Specific critique identifying gaps, inappropriate parameters, or missing prerequisites."
+    )
     strategy_assessment: str = Field(
         default="",
         description="Brief check confirming parameters match observed evidence and preconditions."
+    )
+
+
+class PlanCritiqueResult(BaseModel):
+    """Structured critique evaluating a proposed remediation plan before execution."""
+    approved: bool = Field(
+        description="True ONLY if every proposed action is valid, grounded in evidence, addresses the diagnosed cause, and avoids repeating failed strategies."
+    )
+    addresses_root_cause: bool = Field(
+        default=True,
+        description="Whether proposed actions directly fix the diagnosed root cause."
+    )
+    contradicts_prior_attempts: bool = Field(
+        default=False,
+        description="True if the plan repeats an action/strategy that already failed without new evidence."
+    )
+    tools_valid_and_appropriate: bool = Field(
+        default=True,
+        description="True if all tools and parameters exist in the registry and are permitted/appropriate for the resource."
+    )
+    requires_further_investigation: bool = Field(
+        default=False,
+        description="True if planning cannot proceed without additional diagnostic observations."
+    )
+    should_escalate: bool = Field(
+        default=False,
+        description="True if the incident should escalate rather than execute remediation."
+    )
+    critique_summary: str = Field(
+        description="Concrete, evidence-cited critique of the proposed plan."
+    )
+    recommended_adjustment: Optional[str] = Field(
+        default=None,
+        description="Concrete revision instruction if approved=False."
     )
 
 
@@ -315,6 +381,17 @@ class ReplannerResult(BaseModel):
     needs_further_investigation: bool = Field(
         default=False,
         description="True if existing evidence is insufficient or contradicted and triage must gather more diagnostics."
+    )
+    outcome_classification: Optional[str] = Field(
+        default=None,
+        description=(
+            "Distinguishes outcome cause: 'INCORRECT_DIAGNOSIS', 'INEFFECTIVE_REMEDIATION', "
+            "'NEW_DOWNSTREAM_FAILURE', 'UNRECOVERABLE_DEFECT', or 'UNKNOWN'."
+        ),
+    )
+    expected_vs_observed: Optional[str] = Field(
+        default=None,
+        description="Direct comparison of planned expected_outcome vs observed execution and verification telemetry."
     )
     outcome_reflection: Optional[str] = Field(
         default=None,

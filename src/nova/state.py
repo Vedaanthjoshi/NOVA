@@ -73,6 +73,14 @@ class ExecutionRecord(BaseModel):
     stderr: str
     duration_seconds: float
     success: bool
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    command_success: Optional[bool] = None
+    postcondition_passed: Optional[bool] = None
+    postcondition_error: Optional[str] = None
+    environment_changed: Optional[bool] = None
+    execution_id: Optional[str] = None
+    task_attempts: Optional[int] = None
+    details: Dict[str, Any] = Field(default_factory=dict)
     action_hash: Optional[str] = None
     idempotency_token: Optional[str] = None
     approved_by: Optional[str] = None
@@ -98,6 +106,8 @@ class DiagnosticRecord(BaseModel):
     success: bool
     timestamp: str
     rationale: Optional[str] = None
+    execution_epoch: int = 0
+    env_fingerprint: Optional[str] = None
 
 
 class ApprovalRequest(BaseModel):
@@ -119,10 +129,12 @@ class NovaState(BaseModel):
     raw_symptoms: str
     status: IncidentStatus = IncidentStatus.TRIGGERED
 
-    # Workflow Run Binding (M11 / M12)
+    # Workflow Run Binding (M11 / M12 / M13)
     workflow_id: Optional[str] = None
     workflow_run_id: Optional[str] = None
     baseline_attempts: Optional[int] = None
+    baseline_task_attempts: Optional[Dict[str, int]] = None
+    baseline_task_states: Optional[Dict[str, str]] = None
     expected_output: Optional[Dict[str, Any]] = None
 
     # Investigation & Triage
@@ -131,6 +143,8 @@ class NovaState(BaseModel):
     investigation_evidence: List[str] = Field(default_factory=list)
     diagnostic_history: List[DiagnosticRecord] = Field(default_factory=list)
     reflection_history: List[Dict[str, Any]] = Field(default_factory=list)
+    hypothesis_revisions: List[Dict[str, Any]] = Field(default_factory=list)
+    plan_revisions: List[Dict[str, Any]] = Field(default_factory=list)
 
     # Diagnosis & Planning
     failure_type: Optional[str] = None
@@ -167,10 +181,12 @@ class NovaGraphState(TypedDict, total=False):
     raw_symptoms: str
     status: IncidentStatus
 
-    # Workflow Run Binding (M11 / M12)
+    # Workflow Run Binding (M11 / M12 / M13)
     workflow_id: Optional[str]
     workflow_run_id: Optional[str]
     baseline_attempts: Optional[int]
+    baseline_task_attempts: Optional[Dict[str, int]]
+    baseline_task_states: Optional[Dict[str, str]]
     expected_output: Optional[Dict[str, Any]]
 
     # Investigation & Triage
@@ -179,6 +195,8 @@ class NovaGraphState(TypedDict, total=False):
     investigation_evidence: Annotated[List[str], operator.add]
     diagnostic_history: Annotated[List[DiagnosticRecord], operator.add]
     reflection_history: Annotated[List[Dict[str, Any]], operator.add]
+    hypothesis_revisions: Annotated[List[Dict[str, Any]], operator.add]
+    plan_revisions: Annotated[List[Dict[str, Any]], operator.add]
 
     # Diagnosis & Planning
     failure_type: Optional[str]
@@ -202,3 +220,57 @@ class NovaGraphState(TypedDict, total=False):
 
     # Final Output
     final_summary: Optional[str]
+
+
+def build_prior_attempts(state: NovaGraphState | Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Constructs a complete, non-lossy history of attempted actions, parameters,
+    tool outputs, command vs. postcondition outcomes, environment changes,
+    execution/attempt IDs, expected outcomes, and verification records.
+    """
+    plan_by_id: Dict[str, Dict[str, Any]] = {}
+    for act in state.get("plan") or []:
+        act_dict = act.model_dump() if hasattr(act, "model_dump") else dict(act)
+        if act_dict.get("action_id"):
+            plan_by_id[act_dict["action_id"]] = act_dict
+
+    prior_attempts: List[Dict[str, Any]] = []
+    for rec in state.get("execution_history") or []:
+        rec_dict = rec.model_dump() if hasattr(rec, "model_dump") else dict(rec)
+        act_id = rec_dict.get("action_id")
+        planned = plan_by_id.get(act_id or "", {})
+        cmd_ok = rec_dict.get("command_success")
+        if cmd_ok is None:
+            cmd_ok = rec_dict.get("success")
+        prior_attempts.append(
+            {
+                "kind": "execution",
+                "action_id": act_id,
+                "tool_name": rec_dict.get("tool_name"),
+                "parameters": rec_dict.get("parameters") or planned.get("parameters") or {},
+                "expected_outcome": planned.get("expected_outcome"),
+                "stdout": (rec_dict.get("stdout") or "")[:600],
+                "stderr": (rec_dict.get("stderr") or "")[:600],
+                "command_success": cmd_ok,
+                "success": rec_dict.get("success"),
+                "exit_code": rec_dict.get("exit_code"),
+                "postcondition_passed": rec_dict.get("postcondition_passed"),
+                "postcondition_error": rec_dict.get("postcondition_error"),
+                "environment_changed": rec_dict.get("environment_changed"),
+                "execution_id": rec_dict.get("execution_id") or state.get("workflow_run_id"),
+                "task_attempts": rec_dict.get("task_attempts"),
+                "details": rec_dict.get("details") or {},
+            }
+        )
+    for vrec in state.get("verification_history") or []:
+        v_dict = vrec.model_dump() if hasattr(vrec, "model_dump") else dict(vrec)
+        prior_attempts.append(
+            {
+                "kind": "verification",
+                "action_id": v_dict.get("action_id"),
+                "passed": v_dict.get("passed"),
+                "evidence": (v_dict.get("evidence") or "")[:600],
+                "details": v_dict.get("details") or {},
+            }
+        )
+    return prior_attempts

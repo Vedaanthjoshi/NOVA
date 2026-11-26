@@ -87,7 +87,22 @@ def create_verifier_node(env: Any, tool_runner: Optional[ToolRunner] = None):
 
         # Guard 1: Tool execution itself (and its executor-level postcondition) must have succeeded.
         if not last_exec.success or state.get("status") == IncidentStatus.FAILED:
-            evidence_msg = f"Tool execution failed with exit code {last_exec.exit_code}: {last_exec.stderr}"
+            if last_exec.postcondition_passed is False or last_exec.postcondition_error:
+                evidence_msg = (
+                    f"Action '{action.tool_name}' ({action.action_id}) command executed "
+                    f"(exit_code={last_exec.exit_code}, command_success={last_exec.command_success}), "
+                    f"but postcondition failed: {last_exec.postcondition_error or last_exec.stderr}"
+                )
+            elif not last_exec.success:
+                evidence_msg = (
+                    f"Tool execution failed for '{action.tool_name}' ({action.action_id}) "
+                    f"with exit code {last_exec.exit_code}: {last_exec.stderr}"
+                )
+            else:
+                evidence_msg = (
+                    f"Action '{action.tool_name}' ({action.action_id}) completed with exit code "
+                    f"{last_exec.exit_code}, but incident status is FAILED: {state.get('final_summary', '')}"
+                )
             if failed_jobs:
                 evidence_msg += f" | Current failed jobs: {failed_jobs}"
             rec = VerificationRecord(
@@ -96,6 +111,15 @@ def create_verifier_node(env: Any, tool_runner: Optional[ToolRunner] = None):
                 passed=False,
                 evidence=evidence_msg,
                 details={
+                    "action_id": action.action_id,
+                    "tool_name": action.tool_name,
+                    "parameters": last_exec.parameters or action.parameters,
+                    "command_success": last_exec.command_success,
+                    "postcondition_passed": last_exec.postcondition_passed,
+                    "postcondition_error": last_exec.postcondition_error,
+                    "environment_changed": last_exec.environment_changed,
+                    "execution_id": last_exec.execution_id or bound_run_id,
+                    "task_attempts": last_exec.task_attempts,
                     "failed_jobs": failed_jobs,
                     "workflow_id": workflow_state.workflow_id if workflow_state else None,
                 },
@@ -185,8 +209,10 @@ def create_verifier_node(env: Any, tool_runner: Optional[ToolRunner] = None):
                 "final_summary": reason,
             }
 
-        # Guard 4: Fresh attempt binding (do not credit stale prior successes when tracking task attempts)
+        # Guard 4: Fresh attempt binding (do not credit stale prior successes or upstream-only bumps)
         baseline_attempts = state.get("baseline_attempts")
+        baseline_task_attempts = state.get("baseline_task_attempts")
+        baseline_task_states = state.get("baseline_task_states")
         observed_attempts = getattr(workflow_state, "total_attempts", None)
         if baseline_attempts is not None and observed_attempts is not None:
             if observed_attempts <= baseline_attempts:
@@ -207,6 +233,53 @@ def create_verifier_node(env: Any, tool_runner: Optional[ToolRunner] = None):
                 )
                 if is_exhausted:
                     telemetry.record_terminal_reason(incident_id, "ESCALATED", summary)
+                return {
+                    "verification_history": [rec],
+                    "status": IncidentStatus.ESCALATED if is_exhausted else IncidentStatus.FAILED,
+                    "final_summary": summary,
+                }
+
+        # Guard 4b: Environment-specific per-task fresh attempt attribution (rejects upstream-only bumps & stale rows)
+        attempt_details: Dict[str, Any] = {}
+        if hasattr(env, "verify_task_attempt_recovery"):
+            expected_cfg_pre = dict(state.get("expected_output") or {})
+            if hasattr(workflow_state, "inputs") and workflow_state.inputs:
+                for k in ("taxi", "year", "month"):
+                    if k in workflow_state.inputs and k not in expected_cfg_pre:
+                        expected_cfg_pre[k] = workflow_state.inputs[k]
+            att_ok, attempt_details, att_evidence = env.verify_task_attempt_recovery(
+                workflow_state=workflow_state,
+                baseline_task_attempts=baseline_task_attempts,
+                baseline_task_states=baseline_task_states,
+                execution_history=exec_history,
+                expected=expected_cfg_pre,
+            )
+            if not att_ok:
+                rec = VerificationRecord(
+                    action_id=action.action_id,
+                    verified_at=verified_at,
+                    passed=False,
+                    evidence=att_evidence,
+                    details={
+                        "failed_jobs": failed_jobs,
+                        "observed_attempts": observed_attempts,
+                        "attempt_attribution": attempt_details,
+                    },
+                )
+                summary = (
+                    f"Incident Escalated: {att_evidence}"
+                    if is_exhausted
+                    else att_evidence
+                )
+                if is_exhausted:
+                    telemetry.record_terminal_reason(incident_id, "ESCALATED", summary)
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "verification_task_attempt_attribution_failed",
+                    summary,
+                    details=attempt_details,
+                )
                 return {
                     "verification_history": [rec],
                     "status": IncidentStatus.ESCALATED if is_exhausted else IncidentStatus.FAILED,
@@ -301,6 +374,7 @@ def create_verifier_node(env: Any, tool_runner: Optional[ToolRunner] = None):
                 "all_jobs_success": True,
                 "workflow_id": workflow_state.workflow_id,
                 "run_id": workflow_state.run_id,
+                "attempt_attribution": attempt_details,
                 "output_verification": output_details,
             },
         )

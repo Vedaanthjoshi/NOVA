@@ -76,16 +76,25 @@ class NovaApiClient:
         incident_id: Optional[str] = None,
         max_retries: int = 3,
         max_investigation_steps: int = 5,
+        environment: Optional[str] = None,
+        execution_id: Optional[str] = None,
+        kestra_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Submits an operational incident for non-blocking autonomous remediation."""
         url = f"{self.base_url}/incidents/trigger"
-        payload = {
+        payload: Dict[str, Any] = {
             "incident_id": incident_id,
             "target_service": target_service or "UNKNOWN",
             "raw_symptoms": raw_symptoms,
             "max_retries": max_retries,
             "max_investigation_steps": max_investigation_steps,
         }
+        if environment:
+            payload["environment"] = environment
+        if execution_id:
+            payload["execution_id"] = execution_id
+        if kestra_url:
+            payload["kestra_url"] = kestra_url
         with httpx.Client(timeout=self.timeout) as client:
             response = client.post(url, json=payload)
             if response.status_code in (200, 202):
